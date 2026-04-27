@@ -7,10 +7,9 @@ def get_ffmpeg_path():
     动态获取 FFmpeg 二进制文件的路径。
     支持在开发环境和 PyInstaller 打包后的生产环境中查找同级 bin 目录。
     """
-    # 检查是否是被 PyInstaller 打包的环境
     if getattr(sys, 'frozen', False):
-        # sys.executable 是打包后生成的 exe 文件所在的路径
-        base_dir = os.path.dirname(sys.executable)
+        # 打包后，资源文件位于 sys._MEIPASS (即 _internal 文件夹)
+        base_dir = sys._MEIPASS
     else:
         # 否则就是普通的 Python 脚本运行，__file__ 就是本文件路径
         base_dir = os.path.dirname(os.path.abspath(__file__))
