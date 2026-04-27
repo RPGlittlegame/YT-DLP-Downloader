@@ -4,8 +4,8 @@ import customtkinter as ctk
 from tkinter import filedialog
 from core.downloader import YTDlpDownloader
 
-# 设置深色主题和类似 MacOS 的配色外观
-ctk.set_appearance_mode("Dark")
+# 设置主题跟随系统
+ctk.set_appearance_mode("System")
 ctk.set_default_color_theme("blue")
 
 class App(ctk.CTk):
@@ -21,10 +21,10 @@ class App(ctk.CTk):
         
         # 窗口配置
         self.title("YT-DLP Downloader")
-        self.geometry("700x650")
-        self.minsize(600, 600)
+        self.geometry("600x550")
+        self.minsize(500, 500)
         
-        # 网格布局配置 (类似 MacOS 的清爽间距)
+        # 网格布局配置
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(3, weight=1)
         
@@ -39,91 +39,91 @@ class App(ctk.CTk):
 
     def create_widgets(self):
         # --- 顶部输入区 ---
-        self.top_frame = ctk.CTkFrame(self, corner_radius=15, fg_color="transparent")
-        self.top_frame.grid(row=0, column=0, padx=20, pady=(20, 10), sticky="ew")
+        self.top_frame = ctk.CTkFrame(self, corner_radius=10, fg_color="transparent")
+        self.top_frame.grid(row=0, column=0, padx=10, pady=(10, 5), sticky="ew")
         self.top_frame.grid_columnconfigure(1, weight=1)
 
-        self.url_label = ctk.CTkLabel(self.top_frame, text="URL:", font=ctk.CTkFont(size=14, weight="bold"))
-        self.url_label.grid(row=0, column=0, padx=(0, 10), pady=10)
+        self.url_label = ctk.CTkLabel(self.top_frame, text="URL:", font=ctk.CTkFont(size=13, weight="bold"))
+        self.url_label.grid(row=0, column=0, padx=(0, 5), pady=5)
 
-        self.url_entry = ctk.CTkEntry(self.top_frame, placeholder_text="在此输入视频链接...", height=35, corner_radius=8)
-        self.url_entry.grid(row=0, column=1, padx=(0, 10), pady=10, sticky="ew")
+        self.url_entry = ctk.CTkEntry(self.top_frame, placeholder_text="在此输入视频链接...", height=30, corner_radius=6)
+        self.url_entry.grid(row=0, column=1, padx=(0, 5), pady=5, sticky="ew")
 
-        self.fetch_btn = ctk.CTkButton(self.top_frame, text="解析", width=80, height=35, corner_radius=8, command=self.on_fetch)
-        self.fetch_btn.grid(row=0, column=2, pady=10)
+        self.fetch_btn = ctk.CTkButton(self.top_frame, text="解析", width=60, height=30, corner_radius=6, command=self.on_fetch)
+        self.fetch_btn.grid(row=0, column=2, pady=5)
 
         # 解析出的标题显示
-        self.title_label = ctk.CTkLabel(self.top_frame, text="等待解析...", text_color="gray", font=ctk.CTkFont(size=13))
-        self.title_label.grid(row=1, column=0, columnspan=3, pady=(0, 10), sticky="w")
+        self.title_label = ctk.CTkLabel(self.top_frame, text="等待解析...", text_color="gray", font=ctk.CTkFont(size=12))
+        self.title_label.grid(row=1, column=0, columnspan=3, pady=(0, 5), sticky="w")
 
         # --- 选项设置区 ---
-        self.options_frame = ctk.CTkFrame(self, corner_radius=15)
-        self.options_frame.grid(row=1, column=0, padx=20, pady=10, sticky="ew")
+        self.options_frame = ctk.CTkFrame(self, corner_radius=10)
+        self.options_frame.grid(row=1, column=0, padx=10, pady=5, sticky="ew")
         self.options_frame.grid_columnconfigure(1, weight=1)
         self.options_frame.grid_columnconfigure(3, weight=1)
 
         # 视频清晰度
         self.v_quality_label = ctk.CTkLabel(self.options_frame, text="视频:")
-        self.v_quality_label.grid(row=0, column=0, padx=15, pady=10, sticky="w")
+        self.v_quality_label.grid(row=0, column=0, padx=10, pady=5, sticky="w")
         self.v_quality_var = ctk.StringVar(value="自动 (Best)")
         self.v_quality_combo = ctk.CTkComboBox(self.options_frame, variable=self.v_quality_var, 
-                                               values=["自动 (Best)"], corner_radius=8, width=160)
-        self.v_quality_combo.grid(row=0, column=1, padx=15, pady=10, sticky="w")
+                                               values=["自动 (Best)"], corner_radius=6, width=140)
+        self.v_quality_combo.grid(row=0, column=1, padx=5, pady=5, sticky="w")
 
         # 音频质量
         self.a_quality_label = ctk.CTkLabel(self.options_frame, text="音频:")
-        self.a_quality_label.grid(row=0, column=2, padx=15, pady=10, sticky="w")
+        self.a_quality_label.grid(row=0, column=2, padx=10, pady=5, sticky="w")
         self.a_quality_var = ctk.StringVar(value="自动 (Best)")
         self.a_quality_combo = ctk.CTkComboBox(self.options_frame, variable=self.a_quality_var, 
-                                               values=["自动 (Best)"], corner_radius=8, width=160)
-        self.a_quality_combo.grid(row=0, column=3, padx=15, pady=10, sticky="w")
+                                               values=["自动 (Best)"], corner_radius=6, width=140)
+        self.a_quality_combo.grid(row=0, column=3, padx=5, pady=5, sticky="w")
 
         # 格式
         self.format_label = ctk.CTkLabel(self.options_frame, text="格式:")
-        self.format_label.grid(row=1, column=0, padx=15, pady=10, sticky="w")
+        self.format_label.grid(row=1, column=0, padx=10, pady=5, sticky="w")
         self.format_var = ctk.StringVar(value="MP4")
         self.format_combo = ctk.CTkComboBox(self.options_frame, variable=self.format_var,
-                                            values=["MP4", "MKV", "AVI", "WMV", "MOV", "MP3"], corner_radius=8, width=160)
-        self.format_combo.grid(row=1, column=1, padx=15, pady=10, sticky="w")
+                                            values=["MP4", "MKV", "AVI", "WMV", "MOV", "MP3"], corner_radius=6, width=140)
+        self.format_combo.grid(row=1, column=1, padx=5, pady=5, sticky="w")
 
         # 路径选择
         self.path_label = ctk.CTkLabel(self.options_frame, text="保存至:")
-        self.path_label.grid(row=1, column=2, padx=15, pady=10, sticky="w")
+        self.path_label.grid(row=1, column=2, padx=10, pady=5, sticky="w")
         self.output_btn = ctk.CTkButton(self.options_frame, text="选择目录", fg_color="transparent", 
-                                        border_width=1, text_color=("gray10", "#DCE4EE"), corner_radius=8, command=self.choose_output_dir, width=160)
-        self.output_btn.grid(row=1, column=3, padx=15, pady=10, sticky="w")
+                                        border_width=1, text_color=("gray10", "#DCE4EE"), corner_radius=6, command=self.choose_output_dir, width=140)
+        self.output_btn.grid(row=1, column=3, padx=5, pady=5, sticky="w")
 
         # Cookie 选择
         self.cookie_label = ctk.CTkLabel(self.options_frame, text="Cookies:")
-        self.cookie_label.grid(row=2, column=0, padx=15, pady=(0, 15), sticky="w")
+        self.cookie_label.grid(row=2, column=0, padx=10, pady=(0, 10), sticky="w")
         self.cookie_btn = ctk.CTkButton(self.options_frame, text="未选择 (可选)", fg_color="transparent", 
-                                        border_width=1, text_color=("gray10", "#DCE4EE"), corner_radius=8, command=self.choose_cookie_file)
-        self.cookie_btn.grid(row=2, column=1, columnspan=3, padx=15, pady=(0, 15), sticky="ew")
+                                        border_width=1, text_color=("gray10", "#DCE4EE"), corner_radius=6, command=self.choose_cookie_file)
+        self.cookie_btn.grid(row=2, column=1, columnspan=3, padx=5, pady=(0, 10), sticky="ew")
 
         # --- 下载按钮区 ---
         self.action_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.action_frame.grid(row=2, column=0, padx=20, pady=10, sticky="ew")
+        self.action_frame.grid(row=2, column=0, padx=10, pady=5, sticky="ew")
         self.action_frame.grid_columnconfigure(0, weight=1)
         
-        self.download_btn = ctk.CTkButton(self.action_frame, text="开 始 下 载", font=ctk.CTkFont(size=16, weight="bold"), 
-                                          height=45, corner_radius=8, command=self.on_download)
+        self.download_btn = ctk.CTkButton(self.action_frame, text="开 始 下 载", font=ctk.CTkFont(size=14, weight="bold"), 
+                                          height=35, corner_radius=6, command=self.on_download)
         self.download_btn.grid(row=0, column=0, sticky="ew")
 
         # --- 进度与日志区 ---
-        self.log_frame = ctk.CTkFrame(self, corner_radius=15)
-        self.log_frame.grid(row=3, column=0, padx=20, pady=(10, 20), sticky="nsew")
+        self.log_frame = ctk.CTkFrame(self, corner_radius=10)
+        self.log_frame.grid(row=3, column=0, padx=10, pady=(5, 10), sticky="nsew")
         self.log_frame.grid_columnconfigure(0, weight=1)
         self.log_frame.grid_rowconfigure(1, weight=1)
 
-        self.progress_bar = ctk.CTkProgressBar(self.log_frame, corner_radius=8)
-        self.progress_bar.grid(row=0, column=0, padx=15, pady=(15, 5), sticky="ew")
+        self.progress_bar = ctk.CTkProgressBar(self.log_frame, corner_radius=6)
+        self.progress_bar.grid(row=0, column=0, padx=10, pady=(10, 5), sticky="ew")
         self.progress_bar.set(0)
 
-        self.status_label = ctk.CTkLabel(self.log_frame, text="准备就绪", font=ctk.CTkFont(size=12))
-        self.status_label.grid(row=0, column=0, pady=(15, 5)) # Overlay on progress bar loosely or below
+        self.status_label = ctk.CTkLabel(self.log_frame, text="准备就绪", font=ctk.CTkFont(size=11))
+        self.status_label.grid(row=0, column=0, pady=(10, 5)) # Overlay on progress bar loosely or below
 
-        self.log_box = ctk.CTkTextbox(self.log_frame, corner_radius=8, font=ctk.CTkFont(family="Consolas", size=11))
-        self.log_box.grid(row=1, column=0, padx=15, pady=(5, 15), sticky="nsew")
+        self.log_box = ctk.CTkTextbox(self.log_frame, corner_radius=6, font=ctk.CTkFont(family="Consolas", size=11))
+        self.log_box.grid(row=1, column=0, padx=10, pady=(5, 10), sticky="nsew")
         self.log_box.configure(state="disabled")
 
     def choose_output_dir(self):
