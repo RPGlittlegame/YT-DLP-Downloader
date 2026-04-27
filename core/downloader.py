@@ -82,10 +82,10 @@ class YTDlpDownloader:
 
     def fetch_info(self, url, cookiefile=None):
         """
-        提取视频信息（如标题），不进行下载
+        提取视频信息（如标题及所有可用格式），不进行下载
         """
         opts = self.get_base_options()
-        opts['extract_flat'] = 'in_playlist' # 快速提取
+        opts['extract_flat'] = 'in_playlist' # 快速提取，但对于单个视频会提取详细信息
         if cookiefile and os.path.exists(cookiefile):
             opts['cookiefile'] = cookiefile
 
@@ -93,11 +93,45 @@ class YTDlpDownloader:
             try:
                 info = ydl.extract_info(url, download=False)
                 title = info.get('title', 'Unknown Title')
-                return {'status': 'success', 'title': title, 'info': info}
+                
+                formats = info.get('formats', [])
+                video_opts = []
+                audio_opts = []
+                
+                for f in formats:
+                    f_id = f.get('format_id')
+                    ext = f.get('ext', 'unknown')
+                    vcodec = f.get('vcodec', 'none')
+                    acodec = f.get('acodec', 'none')
+                    
+                    if vcodec != 'none':
+                        height = f.get('height') or 0
+                        fps = f.get('fps')
+                        fps_str = f" {fps}fps" if fps else ""
+                        v_str = f"{height}p{fps_str} - {ext} ({vcodec})"
+                        video_opts.append({'id': f_id, 'desc': v_str, 'height': height})
+                        
+                    if acodec != 'none':
+                        abr = f.get('abr') or 0
+                        abr_str = f"{abr}k" if abr else "unknown"
+                        a_str = f"{abr_str} - {ext} ({acodec})"
+                        audio_opts.append({'id': f_id, 'desc': a_str, 'abr': abr})
+                        
+                # 排序：视频按分辨率降序，音频按比特率降序
+                video_opts = sorted(video_opts, key=lambda x: x['height'], reverse=True)
+                audio_opts = sorted(audio_opts, key=lambda x: x['abr'], reverse=True)
+                
+                return {
+                    'status': 'success', 
+                    'title': title, 
+                    'video_opts': video_opts,
+                    'audio_opts': audio_opts,
+                    'info': info
+                }
             except Exception as e:
                 return {'status': 'error', 'message': str(e)}
 
-    def download(self, url, output_path, quality='best', format_type='mp4', cookiefile=None):
+    def download(self, url, output_path, video_format_id='best', audio_format_id='best', format_type='mp4', cookiefile=None):
         """
         执行视频下载
         """
@@ -108,26 +142,38 @@ class YTDlpDownloader:
         outtmpl = os.path.join(output_path, '%(title)s.%(ext)s')
         opts['outtmpl'] = outtmpl
 
-        # 配置质量与格式
-        if quality == 'best':
-            opts['format'] = 'bestvideo+bestaudio/best'
-        elif quality == '1080p':
-            opts['format'] = 'bestvideo[height<=1080]+bestaudio/best[height<=1080]'
-        elif quality == '720p':
-            opts['format'] = 'bestvideo[height<=720]+bestaudio/best[height<=720]'
-        elif quality == 'audio_only':
-            opts['format'] = 'bestaudio/best'
-            opts['extract_audio'] = True
+        # 构造 format 字符串
+        v_id = video_format_id
+        a_id = audio_format_id
         
-        # 配置合并格式 (如果是纯音频则单独处理)
-        if quality != 'audio_only':
+        if v_id == 'none' and a_id == 'none':
+            opts['format'] = 'bestvideo+bestaudio/best'
+        elif v_id == 'none':
+            opts['format'] = a_id
+            opts['extract_audio'] = True
+        elif a_id == 'none':
+            opts['format'] = v_id
+        else:
+            if v_id == 'best' and a_id == 'best':
+                opts['format'] = 'bestvideo+bestaudio/best'
+            elif v_id == 'best':
+                opts['format'] = f'bestvideo+{a_id}/best'
+            elif a_id == 'best':
+                opts['format'] = f'{v_id}+bestaudio/best'
+            else:
+                opts['format'] = f'{v_id}+{a_id}'
+        
+        # 配置合并格式或后处理 (如果是纯音频则单独处理)
+        if v_id != 'none':
             opts['merge_output_format'] = format_type
         else:
-            if format_type == 'mp3':
+            # 纯音频下载，考虑将音频提取/转换为选定的音频格式
+            # 用户在UI的“格式”中如果选了MP3，我们就转成MP3，否则保持原样或转换为其他支持格式
+            if format_type in ['mp3', 'm4a', 'wav', 'flac']:
                 opts['postprocessors'] = [{
                     'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'mp3',
-                    'preferredquality': '192',
+                    'preferredcodec': format_type,
+                    'preferredquality': '192' if format_type == 'mp3' else '0',
                 }]
 
         # 配置 Cookie

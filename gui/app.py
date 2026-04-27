@@ -34,6 +34,8 @@ class App(ctk.CTk):
         self.output_dir = os.path.expanduser("~/Downloads")
         self.output_btn.configure(text=f"📁 {self.output_dir}")
         self.cookie_file = None
+        self.v_opts_map = {}
+        self.a_opts_map = {}
 
     def create_widgets(self):
         # --- 顶部输入区 ---
@@ -60,28 +62,36 @@ class App(ctk.CTk):
         self.options_frame.grid_columnconfigure(1, weight=1)
         self.options_frame.grid_columnconfigure(3, weight=1)
 
-        # 清晰度
-        self.quality_label = ctk.CTkLabel(self.options_frame, text="清晰度:")
-        self.quality_label.grid(row=0, column=0, padx=15, pady=15, sticky="w")
-        self.quality_var = ctk.StringVar(value="最高画质")
-        self.quality_combo = ctk.CTkComboBox(self.options_frame, variable=self.quality_var, 
-                                             values=["最高画质", "1080P", "720P", "仅音频"], corner_radius=8)
-        self.quality_combo.grid(row=0, column=1, padx=15, pady=15, sticky="w")
+        # 视频清晰度
+        self.v_quality_label = ctk.CTkLabel(self.options_frame, text="视频:")
+        self.v_quality_label.grid(row=0, column=0, padx=15, pady=10, sticky="w")
+        self.v_quality_var = ctk.StringVar(value="自动 (Best)")
+        self.v_quality_combo = ctk.CTkComboBox(self.options_frame, variable=self.v_quality_var, 
+                                               values=["自动 (Best)"], corner_radius=8, width=160)
+        self.v_quality_combo.grid(row=0, column=1, padx=15, pady=10, sticky="w")
+
+        # 音频质量
+        self.a_quality_label = ctk.CTkLabel(self.options_frame, text="音频:")
+        self.a_quality_label.grid(row=0, column=2, padx=15, pady=10, sticky="w")
+        self.a_quality_var = ctk.StringVar(value="自动 (Best)")
+        self.a_quality_combo = ctk.CTkComboBox(self.options_frame, variable=self.a_quality_var, 
+                                               values=["自动 (Best)"], corner_radius=8, width=160)
+        self.a_quality_combo.grid(row=0, column=3, padx=15, pady=10, sticky="w")
 
         # 格式
         self.format_label = ctk.CTkLabel(self.options_frame, text="格式:")
-        self.format_label.grid(row=0, column=2, padx=15, pady=15, sticky="w")
+        self.format_label.grid(row=1, column=0, padx=15, pady=10, sticky="w")
         self.format_var = ctk.StringVar(value="MP4")
-        self.format_seg = ctk.CTkSegmentedButton(self.options_frame, values=["MP4", "MKV", "MP3"], 
-                                                 variable=self.format_var, corner_radius=8)
-        self.format_seg.grid(row=0, column=3, padx=15, pady=15, sticky="w")
+        self.format_combo = ctk.CTkComboBox(self.options_frame, variable=self.format_var,
+                                            values=["MP4", "MKV", "AVI", "WMV", "MOV", "MP3"], corner_radius=8, width=160)
+        self.format_combo.grid(row=1, column=1, padx=15, pady=10, sticky="w")
 
         # 路径选择
         self.path_label = ctk.CTkLabel(self.options_frame, text="保存至:")
-        self.path_label.grid(row=1, column=0, padx=15, pady=(0, 15), sticky="w")
+        self.path_label.grid(row=1, column=2, padx=15, pady=10, sticky="w")
         self.output_btn = ctk.CTkButton(self.options_frame, text="选择目录", fg_color="transparent", 
-                                        border_width=1, text_color=("gray10", "#DCE4EE"), corner_radius=8, command=self.choose_output_dir)
-        self.output_btn.grid(row=1, column=1, columnspan=3, padx=15, pady=(0, 15), sticky="ew")
+                                        border_width=1, text_color=("gray10", "#DCE4EE"), corner_radius=8, command=self.choose_output_dir, width=160)
+        self.output_btn.grid(row=1, column=3, padx=15, pady=10, sticky="w")
 
         # Cookie 选择
         self.cookie_label = ctk.CTkLabel(self.options_frame, text="Cookies:")
@@ -160,6 +170,26 @@ class App(ctk.CTk):
                 if res['status'] == 'success':
                     self.title_label.configure(text=f"📌 {res['title']}", text_color="#2CC985")
                     self.update_log(f"解析成功: {res['title']}")
+                    
+                    # 动态填充下拉框
+                    self.v_opts_map = {"自动 (Best)": "best", "无 (仅音频)": "none"}
+                    self.a_opts_map = {"自动 (Best)": "best", "无 (仅视频)": "none"}
+                    
+                    v_vals = ["自动 (Best)", "无 (仅音频)"]
+                    for vo in res.get('video_opts', []):
+                        v_vals.append(vo['desc'])
+                        self.v_opts_map[vo['desc']] = vo['id']
+                        
+                    a_vals = ["自动 (Best)", "无 (仅视频)"]
+                    for ao in res.get('audio_opts', []):
+                        a_vals.append(ao['desc'])
+                        self.a_opts_map[ao['desc']] = ao['id']
+                        
+                    self.v_quality_combo.configure(values=v_vals)
+                    self.a_quality_combo.configure(values=a_vals)
+                    self.v_quality_var.set("自动 (Best)")
+                    self.a_quality_var.set("自动 (Best)")
+                    
                 else:
                     self.title_label.configure(text="解析失败", text_color="#FF4A4A")
                     self.update_log(f"解析失败: {res.get('message')}")
@@ -175,8 +205,10 @@ class App(ctk.CTk):
             return
 
         # 映射UI选择到后台参数
-        q_map = {"最高画质": "best", "1080P": "1080p", "720P": "720p", "仅音频": "audio_only"}
-        quality = q_map.get(self.quality_var.get(), "best")
+        v_desc = self.v_quality_var.get()
+        a_desc = self.a_quality_var.get()
+        v_id = self.v_opts_map.get(v_desc, "best")
+        a_id = self.a_opts_map.get(a_desc, "best")
         format_type = self.format_var.get().lower()
 
         self.download_btn.configure(state="disabled", text="下 载 中 ...")
@@ -186,13 +218,16 @@ class App(ctk.CTk):
         def download_task():
             self.update_log(f"\n--- 开始下载任务 ---")
             self.update_log(f"URL: {url}")
-            self.update_log(f"画质: {quality}, 格式: {format_type}")
+            self.update_log(f"视频选项: {v_desc}")
+            self.update_log(f"音频选项: {a_desc}")
+            self.update_log(f"输出格式: {format_type}")
             self.update_log(f"保存至: {self.output_dir}")
 
             res = self.downloader.download(
                 url=url,
                 output_path=self.output_dir,
-                quality=quality,
+                video_format_id=v_id,
+                audio_format_id=a_id,
                 format_type=format_type,
                 cookiefile=self.cookie_file
             )
