@@ -1,6 +1,9 @@
 import os
 import yt_dlp
 import threading
+import re
+
+_ANSI_ESCAPE = re.compile(r'\x1b\[[0-9;]*m')
 
 class MyLogger:
     """
@@ -11,8 +14,8 @@ class MyLogger:
 
     def debug(self, msg):
         if msg.startswith('[debug] '):
-            pass # 忽略 debug 级别的调试信息，避免日志过多
-        elif self.log_callback:
+            return # 忽略 debug 级别的调试信息，避免日志过多
+        if self.log_callback:
             self.log_callback(msg)
 
     def info(self, msg):
@@ -36,7 +39,8 @@ class YTDlpDownloader:
         self.log_callback = log_callback
         self.progress_callback = progress_callback
         # 记录当前下载的进度状态
-        self._is_cancelled = False
+        self._cancel_event = threading.Event()
+        self._current_filenames = set()
 
     def get_base_options(self):
         """
@@ -47,6 +51,7 @@ class YTDlpDownloader:
             'progress_hooks': [self._progress_hook],
             'noprogress': True, # 禁用默认控制台进度条
             'quiet': False,
+            'socket_timeout': 30,
         }
         if self.ffmpeg_location and os.path.exists(self.ffmpeg_location):
             opts['ffmpeg_location'] = self.ffmpeg_location
@@ -56,20 +61,23 @@ class YTDlpDownloader:
         """
         处理 yt-dlp 进度回调
         """
-        if self._is_cancelled:
-            raise Exception("Download cancelled by user.")
+        if 'filename' in d and d['filename']:
+            self._current_filenames.add(d['filename'])
+            
+        if self._cancel_event.is_set():
+            raise yt_dlp.utils.DownloadCancelled("Download cancelled by user.")
 
         if d['status'] == 'downloading':
             try:
-                # 尝试解析进度百分比
-                percent_str = d.get('_percent_str', '0%').strip('\x1b[0;94m').strip('\x1b[0m').replace('%', '')
-                percent = float(percent_str) / 100.0
+                downloaded = d.get('downloaded_bytes', 0) or 0
+                total = d.get('total_bytes') or d.get('total_bytes_estimate', 0) or 1
+                percent = min(downloaded / total, 1.0)
                 speed = d.get('_speed_str', 'N/A')
                 eta = d.get('_eta_str', 'N/A')
                 
                 if self.progress_callback:
                     self.progress_callback(percent, speed, eta)
-            except Exception:
+            except (ValueError, TypeError, ZeroDivisionError):
                 pass
         elif d['status'] == 'finished':
             if self.progress_callback:
@@ -85,13 +93,15 @@ class YTDlpDownloader:
         提取视频信息（如标题及所有可用格式），不进行下载
         """
         opts = self.get_base_options()
-        opts['extract_flat'] = 'in_playlist' # 快速提取，但对于单个视频会提取详细信息
+        opts['noplaylist'] = True # 若URL包含播放列表，只解析第一个视频
         if cookiefile and os.path.exists(cookiefile):
             opts['cookiefile'] = cookiefile
 
         with yt_dlp.YoutubeDL(opts) as ydl:
             try:
                 info = ydl.extract_info(url, download=False)
+                if info.get('_type') == 'playlist':
+                    return {'status': 'error', 'message': '检测到播放列表链接。请使用单个视频 URL。'}
                 title = info.get('title', 'Unknown Title')
                 
                 formats = info.get('formats', [])
@@ -125,8 +135,7 @@ class YTDlpDownloader:
                     'status': 'success', 
                     'title': title, 
                     'video_opts': video_opts,
-                    'audio_opts': audio_opts,
-                    'info': info
+                    'audio_opts': audio_opts
                 }
             except Exception as e:
                 return {'status': 'error', 'message': str(e)}
@@ -135,7 +144,8 @@ class YTDlpDownloader:
         """
         执行视频下载
         """
-        self._is_cancelled = False
+        self._cancel_event.clear()
+        self._current_filenames.clear()
         opts = self.get_base_options()
 
         # 配置存储路径
@@ -168,13 +178,12 @@ class YTDlpDownloader:
             opts['merge_output_format'] = format_type
         else:
             # 纯音频下载，考虑将音频提取/转换为选定的音频格式
-            # 用户在UI的“格式”中如果选了MP3，我们就转成MP3，否则保持原样或转换为其他支持格式
-            if format_type in ['mp3', 'm4a', 'wav', 'flac']:
-                opts['postprocessors'] = [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': format_type,
-                    'preferredquality': '192' if format_type == 'mp3' else '0',
-                }]
+            audio_format = format_type if format_type in ['mp3', 'm4a', 'wav', 'flac', 'opus'] else 'mp3'
+            opts['postprocessors'] = [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': audio_format,
+                'preferredquality': '192' if audio_format == 'mp3' else '0',
+            }]
 
         # 配置 Cookie
         if cookiefile and os.path.exists(cookiefile):
@@ -185,10 +194,32 @@ class YTDlpDownloader:
                 ydl.download([url])
                 return {'status': 'success'}
             except Exception as e:
-                return {'status': 'error', 'message': str(e)}
+                msg = str(e)
+                if isinstance(e, yt_dlp.utils.DownloadCancelled) or self._cancel_event.is_set() or "Download cancelled" in msg:
+                    self._cleanup_partial_files()
+                    return {'status': 'cancelled', 'message': '用户已取消下载'}
+                return {'status': 'error', 'message': msg}
+
+    def _cleanup_partial_files(self):
+        """清理下载一半产生的残留文件"""
+        for f in self._current_filenames:
+            # yt-dlp 可能会以不同的后缀存储临时文件
+            for ext in ['', '.part', '.ytdl']:
+                path = f + ext
+                # 如果 f 本身带有 .part 后缀，不重复拼接
+                if path.endswith('.part.part'):
+                    continue
+                    
+                if os.path.exists(path):
+                    try:
+                        os.remove(path)
+                        if self.log_callback:
+                            self.log_callback(f"🧹 已清理残留文件: {os.path.basename(path)}")
+                    except Exception:
+                        pass # 忽略删除失败的错误
 
     def cancel_download(self):
         """
         取消下载
         """
-        self._is_cancelled = True
+        self._cancel_event.set()

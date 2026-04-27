@@ -1,4 +1,5 @@
 import os
+import shutil
 import threading
 import customtkinter as ctk
 from tkinter import filedialog
@@ -34,8 +35,21 @@ class App(ctk.CTk):
         self.output_dir = os.path.expanduser("~/Downloads")
         self.output_btn.configure(text=f"📁 {self.output_dir}")
         self.cookie_file = None
+        self.cookie_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cookies")
         self.v_opts_map = {}
         self.a_opts_map = {}
+        
+        # 初始化状态
+        self._is_downloading = False
+        self.protocol("WM_DELETE_WINDOW", self.on_closing)
+        
+        # 初始化 cookie 列表
+        self.update_cookie_list()
+
+    def on_closing(self):
+        if self._is_downloading:
+            self.downloader.cancel_download()
+        self.destroy()
 
     def create_widgets(self):
         # --- 顶部输入区 ---
@@ -96,34 +110,49 @@ class App(ctk.CTk):
         # Cookie 选择
         self.cookie_label = ctk.CTkLabel(self.options_frame, text="Cookies:")
         self.cookie_label.grid(row=2, column=0, padx=10, pady=(0, 10), sticky="w")
-        self.cookie_btn = ctk.CTkButton(self.options_frame, text="未选择 (可选)", fg_color="transparent", 
-                                        border_width=1, text_color=("gray10", "#DCE4EE"), corner_radius=6, command=self.choose_cookie_file)
-        self.cookie_btn.grid(row=2, column=1, columnspan=3, padx=5, pady=(0, 10), sticky="ew")
+        
+        self.cookie_frame = ctk.CTkFrame(self.options_frame, fg_color="transparent")
+        self.cookie_frame.grid(row=2, column=1, columnspan=3, padx=5, pady=(0, 10), sticky="ew")
+        self.cookie_frame.grid_columnconfigure(0, weight=1)
+
+        self.cookie_var = ctk.StringVar(value="未选择 (可选)")
+        self.cookie_menu = ctk.CTkOptionMenu(self.cookie_frame, variable=self.cookie_var,
+                                             values=["未选择 (可选)"], corner_radius=6, command=self.on_cookie_select)
+        self.cookie_menu.grid(row=0, column=0, sticky="ew")
+
+        self.cookie_import_btn = ctk.CTkButton(self.cookie_frame, text="导入 Cookie", width=90, corner_radius=6, command=self.import_cookie_file)
+        self.cookie_import_btn.grid(row=0, column=1, padx=(5, 0))
 
         # --- 下载按钮区 ---
         self.action_frame = ctk.CTkFrame(self, fg_color="transparent")
         self.action_frame.grid(row=2, column=0, padx=10, pady=5, sticky="ew")
         self.action_frame.grid_columnconfigure(0, weight=1)
+        self.action_frame.grid_columnconfigure(1, weight=0)
         
         self.download_btn = ctk.CTkButton(self.action_frame, text="开 始 下 载", font=ctk.CTkFont(size=14, weight="bold"), 
                                           height=35, corner_radius=6, command=self.on_download)
-        self.download_btn.grid(row=0, column=0, sticky="ew")
+        self.download_btn.grid(row=0, column=0, sticky="ew", padx=(0, 5))
+
+        self.cancel_btn = ctk.CTkButton(self.action_frame, text="取消", font=ctk.CTkFont(size=14, weight="bold"), 
+                                        width=80, height=35, corner_radius=6, fg_color="#E74C3C", hover_color="#C0392B", 
+                                        state="disabled", command=self.on_cancel)
+        self.cancel_btn.grid(row=0, column=1, sticky="e")
 
         # --- 进度与日志区 ---
         self.log_frame = ctk.CTkFrame(self, corner_radius=10)
         self.log_frame.grid(row=3, column=0, padx=10, pady=(5, 10), sticky="nsew")
         self.log_frame.grid_columnconfigure(0, weight=1)
-        self.log_frame.grid_rowconfigure(1, weight=1)
+        self.log_frame.grid_rowconfigure(2, weight=1)
 
         self.progress_bar = ctk.CTkProgressBar(self.log_frame, corner_radius=6)
         self.progress_bar.grid(row=0, column=0, padx=10, pady=(10, 5), sticky="ew")
         self.progress_bar.set(0)
 
         self.status_label = ctk.CTkLabel(self.log_frame, text="准备就绪", font=ctk.CTkFont(size=11))
-        self.status_label.grid(row=0, column=0, pady=(10, 5)) # Overlay on progress bar loosely or below
+        self.status_label.grid(row=1, column=0, pady=(0, 5))
 
         self.log_box = ctk.CTkTextbox(self.log_frame, corner_radius=6, font=ctk.CTkFont(family="Consolas", size=11))
-        self.log_box.grid(row=1, column=0, padx=10, pady=(5, 10), sticky="nsew")
+        self.log_box.grid(row=2, column=0, padx=10, pady=(5, 10), sticky="nsew")
         self.log_box.configure(state="disabled")
 
     def choose_output_dir(self):
@@ -132,11 +161,61 @@ class App(ctk.CTk):
             self.output_dir = dir_path
             self.output_btn.configure(text=f"📁 {self.output_dir}")
 
-    def choose_cookie_file(self):
+    def update_cookie_list(self):
+        if not os.path.exists(self.cookie_dir):
+            os.makedirs(self.cookie_dir)
+            
+        cookies = ["未选择 (可选)"]
+        for f in os.listdir(self.cookie_dir):
+            if f.endswith(".txt"):
+                cookies.append(f)
+                
+        self.cookie_menu.configure(values=cookies)
+        
+        # 如果当前选中的不再列表中，重置为未选择
+        if self.cookie_var.get() not in cookies:
+            self.cookie_var.set("未选择 (可选)")
+            self.cookie_file = None
+
+    def on_cookie_select(self, choice):
+        if choice == "未选择 (可选)":
+            self.cookie_file = None
+            return
+            
+        path = os.path.join(self.cookie_dir, choice)
+        try:
+            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                first_line = f.readline()
+            if 'Netscape' not in first_line and not first_line.startswith('#'):
+                self.update_log(f"⚠️ 警告: {choice} 可能不是有效的 Netscape Cookie 格式文件。")
+        except OSError:
+            self.update_log(f"⚠️ 警告: 无法读取 Cookie 文件 {choice}。")
+            
+        self.cookie_file = path
+
+    def import_cookie_file(self):
         file_path = filedialog.askopenfilename(filetypes=[("Text Files", "*.txt"), ("All Files", "*.*")])
         if file_path:
-            self.cookie_file = file_path
-            self.cookie_btn.configure(text=f"🍪 {os.path.basename(file_path)}")
+            if not os.path.exists(self.cookie_dir):
+                os.makedirs(self.cookie_dir)
+                
+            filename = os.path.basename(file_path)
+            dest_path = os.path.join(self.cookie_dir, filename)
+            
+            if not os.path.abspath(dest_path).startswith(os.path.abspath(self.cookie_dir)):
+                self.update_log("错误: 非法的 Cookie 文件名。")
+                return
+                
+            try:
+                if os.path.abspath(file_path) != os.path.abspath(dest_path):
+                    shutil.copy2(file_path, dest_path)
+                
+                self.update_cookie_list()
+                self.cookie_var.set(filename)
+                self.cookie_file = dest_path
+                self.update_log(f"成功导入 Cookie: {filename}")
+            except Exception as e:
+                self.update_log(f"导入 Cookie 失败: {str(e)}")
 
     def update_log(self, msg):
         """ 线程安全的日志更新 """
@@ -153,6 +232,13 @@ class App(ctk.CTk):
             self.progress_bar.set(percent)
             self.status_label.configure(text=f"{percent*100:.1f}% | 速度: {speed} | 剩余: {eta}")
         self.after(0, task)
+
+    def on_cancel(self):
+        self.update_log("正在取消下载，请稍候...")
+        self.cancel_btn.configure(state="disabled")
+        self.progress_bar.set(0)
+        self.status_label.configure(text="正在中止并清理文件...")
+        self.downloader.cancel_download()
 
     def on_fetch(self):
         url = self.url_entry.get().strip()
@@ -199,9 +285,20 @@ class App(ctk.CTk):
         threading.Thread(target=fetch_task, daemon=True).start()
 
     def on_download(self):
+        if self._is_downloading:
+            return
+            
+        if self.fetch_btn.cget("state") == "disabled":
+            self.update_log("错误: 请等待解析完成后再开始下载。")
+            return
+
         url = self.url_entry.get().strip()
         if not url:
             self.update_log("错误: 请先输入视频链接。")
+            return
+            
+        if not os.path.isdir(self.output_dir):
+            self.update_log(f"错误: 保存目录不存在，请重新选择: {self.output_dir}")
             return
 
         # 映射UI选择到后台参数
@@ -211,7 +308,9 @@ class App(ctk.CTk):
         a_id = self.a_opts_map.get(a_desc, "best")
         format_type = self.format_var.get().lower()
 
+        self._is_downloading = True
         self.download_btn.configure(state="disabled", text="下 载 中 ...")
+        self.cancel_btn.configure(state="normal")
         self.progress_bar.set(0)
         self.status_label.configure(text="初始化下载...")
 
@@ -233,10 +332,16 @@ class App(ctk.CTk):
             )
 
             def update_ui():
+                self._is_downloading = False
                 self.download_btn.configure(state="normal", text="开 始 下 载")
+                self.cancel_btn.configure(state="disabled")
                 if res['status'] == 'success':
                     self.status_label.configure(text="✅ 下载完成！")
                     self.update_log("--- 任务圆满完成 ---")
+                elif res['status'] == 'cancelled':
+                    self.status_label.configure(text="⏸️ 已取消")
+                    self.progress_bar.set(0)
+                    self.update_log("下载已取消")
                 else:
                     self.status_label.configure(text="❌ 下载出错")
                     self.update_log(f"错误信息: {res.get('message')}")

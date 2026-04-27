@@ -31,6 +31,7 @@ MANIFEST
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
 *.spec
+!YT-DLP_Downloader.spec
 
 # Installer logs
 pip-log.txt
@@ -184,6 +185,7 @@ desktop.ini
 
 # 打包工具产生的临时文件
 *.spec
+!YT-DLP_Downloader.spec
 build/
 dist/
 
@@ -196,4 +198,4 @@ dist/
 
 # App Specific Files
 bin/
-cookies.txt
+cookies/

@@ -37,4 +37,11 @@ if __name__ == "__main__":
     
     # 2. 实例化并运行主程序界面
     app = App(ffmpeg_location=ffmpeg_loc)
+    
+    # 增加 FFmpeg 检查警告显示
+    if not os.path.exists(ffmpeg_loc):
+        app.after(500, lambda: app.update_log(
+            "⚠️ 警告：未找到内置 FFmpeg。合并音视频功能将不可用。"
+        ))
+        
     app.mainloop()
