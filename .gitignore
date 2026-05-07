@@ -32,6 +32,7 @@ MANIFEST
 *.manifest
 *.spec
 !YT-DLP_Downloader.spec
+!YT-DLP_Downloader_macOS.spec
 
 # Installer logs
 pip-log.txt
