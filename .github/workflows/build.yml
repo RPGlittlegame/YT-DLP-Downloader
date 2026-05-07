@@ -47,14 +47,14 @@ jobs:
 
       - name: PyInstaller Build
         run: |
-          appname="YT-DLP-Downloader"
-          pyinstaller --name "$appname" main.py
+          # 使用 .spec 文件进行打包以确保包含全部静态资源
+          pyinstaller YT-DLP_Downloader.spec
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-            mkdir -p "dist/$appname/bin"
-            cp bin/ffmpeg.exe "dist/$appname/bin/ffmpeg.exe"
+            mkdir -p "dist/YT-DLP_Downloader/bin"
+            cp bin/ffmpeg.exe "dist/YT-DLP_Downloader/bin/ffmpeg.exe"
           else
-            mkdir -p "dist/$appname/bin"
-            cp bin/ffmpeg "dist/$appname/bin/ffmpeg"
+            mkdir -p "dist/YT-DLP_Downloader/bin"
+            cp bin/ffmpeg "dist/YT-DLP_Downloader/bin/ffmpeg"
           fi
         shell: bash
 
@@ -63,4 +63,4 @@ jobs:
         with:
           name: ${{ matrix.os }}-YT-DLP-Downloader-${{ github.run_number }}
           path: |
-            dist/YT-DLP-Downloader/**
+            dist/YT-DLP_Downloader/**
