@@ -1,17 +1,12 @@
 # -*- mode: python ; coding: utf-8 -*-
-import sys
 
-ffmpeg_data = []
-if sys.platform == "win32":
-    ffmpeg_data.append(('bin/ffmpeg.exe', 'bin/'))
-else:
-    ffmpeg_data.append(('bin/ffmpeg', 'bin/'))
 
 a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=ffmpeg_data + [
+    datas=[
+        ('bin/ffmpeg.exe', 'bin/'),
         ('YDD.icon/icon.ico', 'YDD.icon/'),
         ('YDD.icon/Assets/square.and.arrow.down.fill.png', 'YDD.icon/Assets/'),
     ],
