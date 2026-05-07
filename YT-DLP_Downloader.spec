@@ -5,7 +5,11 @@ a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[('bin/ffmpeg.exe', 'bin/')],
+    datas=[
+        ('bin/ffmpeg.exe', 'bin/'),
+        ('YDD.icon/icon.ico', 'YDD.icon/'),
+        ('YDD.icon/Assets/square.and.arrow.down.fill.png', 'YDD.icon/Assets/'),
+    ],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -32,6 +36,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon='YDD.icon/icon.ico',
 )
 coll = COLLECT(
     exe,

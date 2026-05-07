@@ -90,7 +90,7 @@ class YTDlpDownloader:
 
     def fetch_info(self, url, cookiefile=None):
         """
-        提取视频信息（如标题及所有可用格式），不进行下载
+        提取视频信息（如标题、所有可用格式、字幕），不进行下载
         """
         opts = self.get_base_options()
         opts['noplaylist'] = True # 若URL包含播放列表，只解析第一个视频
@@ -113,36 +113,81 @@ class YTDlpDownloader:
                     ext = f.get('ext', 'unknown')
                     vcodec = f.get('vcodec', 'none')
                     acodec = f.get('acodec', 'none')
+                    # 获取文件大小（优先精确值，否则取估算值）
+                    filesize = f.get('filesize') or f.get('filesize_approx')
                     
                     if vcodec != 'none':
                         height = f.get('height') or 0
                         fps = f.get('fps')
                         fps_str = f" {fps}fps" if fps else ""
                         v_str = f"{height}p{fps_str} - {ext} ({vcodec})"
-                        video_opts.append({'id': f_id, 'desc': v_str, 'height': height})
+                        video_opts.append({
+                            'id': f_id,
+                            'desc': v_str,
+                            'height': height,
+                            'filesize': filesize
+                        })
                         
                     if acodec != 'none':
                         abr = f.get('abr') or 0
                         abr_str = f"{abr}k" if abr else "unknown"
                         a_str = f"{abr_str} - {ext} ({acodec})"
-                        audio_opts.append({'id': f_id, 'desc': a_str, 'abr': abr})
+                        audio_opts.append({
+                            'id': f_id,
+                            'desc': a_str,
+                            'abr': abr,
+                            'filesize': filesize
+                        })
                         
                 # 排序：视频按分辨率降序，音频按比特率降序
                 video_opts = sorted(video_opts, key=lambda x: x['height'], reverse=True)
                 audio_opts = sorted(audio_opts, key=lambda x: x['abr'], reverse=True)
-                
+
+                # --- 提取字幕信息 ---
+                subtitle_opts = []
+                manual_subs = info.get('subtitles', {})
+                auto_subs = info.get('automatic_captions', {})
+
+                for lang, sub_list in manual_subs.items():
+                    # 尝试获取语言名称（部分格式携带 name 字段）
+                    name = lang
+                    if sub_list and isinstance(sub_list, list) and sub_list[0].get('name'):
+                        name = sub_list[0]['name']
+                    subtitle_opts.append({
+                        'lang': lang,
+                        'desc': f"{name} ({lang})",
+                        'auto': False
+                    })
+
+                for lang, sub_list in auto_subs.items():
+                    if lang in manual_subs:
+                        continue  # 手动字幕优先，跳过同语言的自动字幕
+                    name = lang
+                    if sub_list and isinstance(sub_list, list) and sub_list[0].get('name'):
+                        name = sub_list[0]['name']
+                    subtitle_opts.append({
+                        'lang': lang,
+                        'desc': f"{name} [{lang}] (自动)",
+                        'auto': True
+                    })
+
+                # 排序：手动字幕优先，然后按语言代码字母顺序
+                subtitle_opts.sort(key=lambda x: (x['auto'], x['lang']))
+
                 return {
-                    'status': 'success', 
-                    'title': title, 
+                    'status': 'success',
+                    'title': title,
                     'video_opts': video_opts,
-                    'audio_opts': audio_opts
+                    'audio_opts': audio_opts,
+                    'subtitle_opts': subtitle_opts
                 }
             except Exception as e:
                 return {'status': 'error', 'message': str(e)}
 
-    def download(self, url, output_path, video_format_id='best', audio_format_id='best', format_type='mp4', cookiefile=None):
+    def download(self, url, output_path, video_format_id='best', audio_format_id='best',
+                 format_type='mp4', cookiefile=None, subtitle_lang=None, subtitle_embed=True):
         """
-        执行视频下载
+        执行视频下载，支持字幕下载（嵌入或单独保存）
         """
         self._cancel_event.clear()
         self._current_filenames.clear()
@@ -184,6 +229,20 @@ class YTDlpDownloader:
                 'preferredcodec': audio_format,
                 'preferredquality': '192' if audio_format == 'mp3' else '0',
             }]
+
+        # --- 配置字幕 ---
+        if subtitle_lang and subtitle_lang != 'none':
+            opts['writesubtitles'] = True
+            opts['subtitleslangs'] = [subtitle_lang]
+            opts['subtitlesformat'] = 'srt/vtt'
+            if subtitle_embed and v_id != 'none':
+                # 嵌入字幕到视频文件中
+                opts['embedsubtitles'] = True
+                # 确保 FFmpegEmbedSubtitle postprocessor 被加入
+                pp_list = opts.get('postprocessors', [])
+                pp_list.append({'key': 'FFmpegEmbedSubtitle'})
+                opts['postprocessors'] = pp_list
+            # 若为纯音频或选择"单独下载"，字幕以独立文件形式保存（不嵌入）
 
         # 配置 Cookie
         if cookiefile and os.path.exists(cookiefile):
