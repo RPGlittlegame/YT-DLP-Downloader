@@ -25,13 +25,15 @@ jobs:
           python-version: '3.14'
           cache: 'pip'
 
+      # 只改动了这里
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install pyinstaller
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller
+          if [ -f requirements.txt ]; then python -m pip install -r requirements.txt; fi
         shell: bash
 
+      # 其它步骤无需改动
       - name: Download ffmpeg
         run: |
           mkdir -p bin
@@ -49,7 +51,6 @@ jobs:
 
       - name: PyInstaller Build
         run: |
-          # 使用 .spec 文件进行打包以确保包含全部静态资源
           pyinstaller YT-DLP_Downloader.spec
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
             mkdir -p "dist/YT-DLP_Downloader/bin"
