@@ -1,15 +1,20 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os
+
+datas = [
+    ('YDD.icon/icon.icns', 'YDD.icon/'),
+    ('YDD.icon/Assets/square.and.arrow.down.fill.png', 'YDD.icon/Assets/'),
+]
+
+if os.path.exists('bin/ffmpeg'):
+    datas.append(('bin/ffmpeg', 'bin/'))
 
 a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[
-        ('bin/ffmpeg', 'bin/'),
-        ('YDD.icon/icon.icns', 'YDD.icon/'),
-        ('YDD.icon/Assets/square.and.arrow.down.fill.png', 'YDD.icon/Assets/'),
-    ],
-    hiddenimports=[],
+    datas=datas,
+    hiddenimports=['PIL', 'PIL.Image', 'imageio_ffmpeg'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
