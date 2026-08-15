@@ -360,9 +360,17 @@ class YTDlpDownloader:
                         "⏸️ 下载已暂停/取消。保留未完成的 .part 临时文件，支持下次继续下载。"
                     )
                 return {"status": "cancelled", "message": "用户已取消下载"}
-            except Exception as exc:
-                msg = str(exc)
-                if self._cancel_event.is_set() or "Download cancelled" in msg:
+            except BaseException as err:
+                msg = str(err)
+                if self._cancel_event.is_set():
+                    if cleanup_on_cancel:
+                        self._cleanup_partial_files()
+                    elif self.log_callback:
+                        self.log_callback(
+                            "⏸️ 下载已暂停/取消。保留未完成的 .part 临时文件，支持下次继续下载。"
+                        )
+                    return {"status": "cancelled", "message": "用户已取消下载"}
+                if "Download cancelled" in msg:
                     if cleanup_on_cancel:
                         self._cleanup_partial_files()
                     elif self.log_callback:

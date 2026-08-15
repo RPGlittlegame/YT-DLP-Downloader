@@ -1,4 +1,3 @@
 yt-dlp
 customtkinter
 pillow
-imageio-ffmpeg>=0.4.9

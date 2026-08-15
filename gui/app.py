@@ -15,10 +15,11 @@ ctk.set_default_color_theme("blue")
 
 
 class App(ctk.CTk):
-    def __init__(self, ffmpeg_location=None):
+    def __init__(self, ffmpeg_location=None, ffmpeg_type="未检测到"):
         super().__init__()
 
         self.ffmpeg_location = ffmpeg_location
+        self.ffmpeg_type = ffmpeg_type
         self.downloader = YTDlpDownloader(
             ffmpeg_location=self.ffmpeg_location,
             log_callback=self.update_log,
@@ -28,21 +29,27 @@ class App(ctk.CTk):
 
         # 窗口配置
         self.title("YT-DLP Downloader")
-        self.geometry("620x680")
-        self.minsize(520, 600)
+        self.geometry("680x760")
+        self.minsize(580, 680)
 
         # 设置应用图标
         self._set_app_icon()
 
-        # 网格布局配置
+        # 主网格布局配置：
+        # row 0: 顶部输入 (weight=0)
+        # row 1: 选项设置 (weight=0)
+        # row 2: 播放列表卡片 (weight=0)
+        # row 3: 开始下载按钮 (weight=0, 保证绝不被遮挡或压缩)
+        # row 4: 进度与日志区 (weight=1, 吸收剩余窗口拉伸)
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(3, weight=1)
+        self.grid_rowconfigure(0, weight=0)
+        self.grid_rowconfigure(1, weight=0)
+        self.grid_rowconfigure(2, weight=0)
+        self.grid_rowconfigure(3, weight=0)
+        self.grid_rowconfigure(4, weight=1)
 
-        self.create_widgets()
-
-        # 默认值设置
+        # 默认值及状态变量初始化（必须在 create_widgets 前完成）
         self.output_dir = os.path.expanduser("~/Downloads")
-        self.output_btn.configure(text=f"📁 {self.output_dir}")
         self.cookie_file = None
         self.cookie_dir = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cookies"
@@ -53,9 +60,17 @@ class App(ctk.CTk):
         self.a_opts_map = {}
         # 字幕映射表 desc -> lang_code
         self.s_opts_map = {}
-        # 播放列表元数据
+        # 播放列表元数据及选择状态
         self.is_playlist = False
         self.playlist_entries = []
+        self.playlist_check_vars = []  # 保存每个条目的 BooleanVar
+        self.playlist_mode_var = ctk.StringVar(value="全部下载")
+        self.playlist_range_var = ctk.StringVar(value="")
+        self.resume_download_var = ctk.BooleanVar(value=True)  # 断点续传开关，默认开启
+
+        self.create_widgets()
+
+        self.output_btn.configure(text=f"📁 {self.output_dir}")
 
         # 绑定选项变化回调，用于动态更新预估大小
         self.v_quality_var.trace_add("write", self.update_size_estimate)
@@ -72,7 +87,7 @@ class App(ctk.CTk):
     def _set_app_icon(self):
         """设置应用图标，优先使用 .ico（Windows），回退到 PNG"""
         if getattr(sys, "frozen", False):
-            base_dir = sys._MEIPASS
+            base_dir = getattr(sys, "_MEIPASS", "")
         else:
             base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -87,7 +102,7 @@ class App(ctk.CTk):
             elif os.path.exists(png_path):
                 img = Image.open(png_path)
                 self._icon_photo = ImageTk.PhotoImage(img)
-                self.iconphoto(True, self._icon_photo)
+                self.iconphoto(True, self._icon_photo)  # type: ignore
         except Exception:
             pass  # 图标设置失败不影响主程序
 
@@ -127,14 +142,42 @@ class App(ctk.CTk):
         )
         self.fetch_btn.grid(row=0, column=2, pady=5)
 
+        # 标题与 FFmpeg 状态行
+        self.title_row = ctk.CTkFrame(self.top_frame, fg_color="transparent")
+        self.title_row.grid(row=1, column=0, columnspan=3, pady=(0, 5), sticky="ew")
+        self.title_row.grid_columnconfigure(0, weight=1)
+
         # 解析出的标题显示
         self.title_label = ctk.CTkLabel(
-            self.top_frame,
+            self.title_row,
             text="等待解析...",
             text_color="gray",
             font=ctk.CTkFont(size=12),
         )
-        self.title_label.grid(row=1, column=0, columnspan=3, pady=(0, 5), sticky="w")
+        self.title_label.grid(row=0, column=0, sticky="w")
+
+        # FFmpeg 状态徽章
+        ffmpeg_is_ok = (
+            self.ffmpeg_location is not None and self.ffmpeg_type != "未检测到"
+        )
+        badge_text = f"⚙️ FFmpeg: {self.ffmpeg_type}"
+        badge_fg = ("#D4EDDA", "#1E3A2F") if ffmpeg_is_ok else ("#F8D7DA", "#3E2723")
+        badge_text_color = (
+            ("#155724", "#4CAF50") if ffmpeg_is_ok else ("#721C24", "#EF5350")
+        )
+
+        self.ffmpeg_badge = ctk.CTkButton(
+            self.title_row,
+            text=badge_text,
+            fg_color=badge_fg,
+            text_color=badge_text_color,
+            hover_color=badge_fg,
+            corner_radius=6,
+            font=ctk.CTkFont(size=11),
+            height=24,
+            command=self.open_dependency_settings,
+        )
+        self.ffmpeg_badge.grid(row=0, column=1, sticky="e")
 
         # --- 选项设置区 ---
         self.options_frame = ctk.CTkFrame(self, corner_radius=10)
@@ -223,11 +266,11 @@ class App(ctk.CTk):
 
         # 行 3：Cookie 选择
         self.cookie_label = ctk.CTkLabel(self.options_frame, text="Cookies:")
-        self.cookie_label.grid(row=3, column=0, padx=10, pady=(0, 10), sticky="w")
+        self.cookie_label.grid(row=3, column=0, padx=10, pady=5, sticky="w")
 
         self.cookie_frame = ctk.CTkFrame(self.options_frame, fg_color="transparent")
         self.cookie_frame.grid(
-            row=3, column=1, columnspan=3, padx=5, pady=(0, 10), sticky="ew"
+            row=3, column=1, columnspan=3, padx=5, pady=5, sticky="ew"
         )
         self.cookie_frame.grid_columnconfigure(0, weight=1)
 
@@ -250,9 +293,114 @@ class App(ctk.CTk):
         )
         self.cookie_import_btn.grid(row=0, column=1, padx=(5, 0))
 
-        # --- 下载按钮区（含预估大小标签）---
+        # 行 4：高级下载选项（断点续传开关）
+        self.adv_label = ctk.CTkLabel(self.options_frame, text="高级:")
+        self.adv_label.grid(row=4, column=0, padx=10, pady=(0, 10), sticky="w")
+
+        self.adv_frame = ctk.CTkFrame(self.options_frame, fg_color="transparent")
+        self.adv_frame.grid(
+            row=4, column=1, columnspan=3, padx=5, pady=(0, 10), sticky="ew"
+        )
+
+        self.resume_switch = ctk.CTkSwitch(
+            self.adv_frame,
+            text="启用断点续传（下载中断时保留 .part 临时文件以便续传）",
+            variable=self.resume_download_var,
+            font=ctk.CTkFont(size=12),
+        )
+        self.resume_switch.pack(side="left", anchor="w")
+
+        # --- 播放列表选集卡片 (初始隐藏，解析到 Playlist 时展开) ---
+        self.playlist_frame = ctk.CTkFrame(self, corner_radius=10)
+        self.playlist_frame.grid_columnconfigure(0, weight=1)
+
+        # 播放列表头部控制栏
+        self.pl_header = ctk.CTkFrame(self.playlist_frame, fg_color="transparent")
+        self.pl_header.pack(fill="x", padx=10, pady=(10, 5))
+        self.pl_header.grid_columnconfigure(1, weight=1)
+
+        self.pl_title_label = ctk.CTkLabel(
+            self.pl_header,
+            text="📑 播放列表选项:",
+            font=ctk.CTkFont(size=12, weight="bold"),
+        )
+        self.pl_title_label.grid(row=0, column=0, padx=(0, 10), sticky="w")
+
+        self.pl_mode_btn = ctk.CTkSegmentedButton(
+            self.pl_header,
+            values=["全部下载", "范围选取", "勾选单集"],
+            variable=self.playlist_mode_var,
+            command=self._on_playlist_mode_change,
+        )
+        self.pl_mode_btn.grid(row=0, column=1, sticky="w")
+
+        # 范围输入容器
+        self.pl_range_container = ctk.CTkFrame(
+            self.playlist_frame, fg_color="transparent"
+        )
+        self.pl_range_container.grid_columnconfigure(1, weight=1)
+
+        self.pl_range_label = ctk.CTkLabel(
+            self.pl_range_container,
+            text="范围 (例如 1-5, 8, 11-13):",
+            font=ctk.CTkFont(size=11),
+        )
+        self.pl_range_label.grid(row=0, column=0, padx=(10, 5), pady=2, sticky="w")
+
+        self.pl_range_entry = ctk.CTkEntry(
+            self.pl_range_container,
+            textvariable=self.playlist_range_var,
+            placeholder_text="1-10 或 1,3,5...",
+            height=28,
+            corner_radius=6,
+        )
+        self.pl_range_entry.grid(row=0, column=1, padx=(0, 10), pady=2, sticky="ew")
+
+        # 勾选单集工具栏（全选 / 反选 / 状态统计）
+        self.pl_check_toolbar = ctk.CTkFrame(
+            self.playlist_frame, fg_color="transparent"
+        )
+        self.pl_check_toolbar.grid_columnconfigure(2, weight=1)
+
+        self.pl_select_all_btn = ctk.CTkButton(
+            self.pl_check_toolbar,
+            text="全选",
+            width=50,
+            height=24,
+            font=ctk.CTkFont(size=11),
+            corner_radius=4,
+            command=self._select_all_playlist_items,
+        )
+        self.pl_select_all_btn.grid(row=0, column=0, padx=(10, 5), pady=2)
+
+        self.pl_deselect_all_btn = ctk.CTkButton(
+            self.pl_check_toolbar,
+            text="全不选",
+            width=50,
+            height=24,
+            font=ctk.CTkFont(size=11),
+            corner_radius=4,
+            command=self._deselect_all_playlist_items,
+        )
+        self.pl_deselect_all_btn.grid(row=0, column=1, padx=5, pady=2)
+
+        self.pl_count_label = ctk.CTkLabel(
+            self.pl_check_toolbar,
+            text="已选择: 0 / 0",
+            font=ctk.CTkFont(size=11),
+            text_color="gray",
+        )
+        self.pl_count_label.grid(row=0, column=2, padx=(5, 10), sticky="e")
+
+        # 勾选单集滚动列表 (限制高度为 110px，避免条目过多时挤占底部操作栏)
+        self.pl_scroll_frame = ctk.CTkScrollableFrame(
+            self.playlist_frame, height=110, corner_radius=6
+        )
+        self.pl_scroll_frame.grid_columnconfigure(1, weight=1)
+
+        # --- 下载按钮区（含预估大小标签，固定在 row 3，永不被挤压）---
         self.action_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.action_frame.grid(row=2, column=0, padx=10, pady=5, sticky="ew")
+        self.action_frame.grid(row=3, column=0, padx=10, pady=5, sticky="ew")
         self.action_frame.grid_columnconfigure(0, weight=1)
         self.action_frame.grid_columnconfigure(1, weight=0)
 
@@ -291,9 +439,9 @@ class App(ctk.CTk):
         )
         self.cancel_btn.grid(row=1, column=1, sticky="e")
 
-        # --- 进度与日志区 ---
+        # --- 进度与日志区 (位于 row 4，weight=1 自动适配剩余高度) ---
         self.log_frame = ctk.CTkFrame(self, corner_radius=10)
-        self.log_frame.grid(row=3, column=0, padx=10, pady=(5, 10), sticky="nsew")
+        self.log_frame.grid(row=4, column=0, padx=10, pady=(5, 10), sticky="nsew")
         self.log_frame.grid_columnconfigure(0, weight=1)
         self.log_frame.grid_rowconfigure(2, weight=1)
 
@@ -314,6 +462,114 @@ class App(ctk.CTk):
         self.log_box.grid(row=2, column=0, padx=10, pady=(5, 10), sticky="nsew")
         self.log_box.configure(state="disabled")
 
+    # ── 播放列表控制逻辑 ─────────────────────────────────────────────────────
+    def _on_playlist_mode_change(self, mode):
+        """播放列表模式切换：全部下载 / 范围选取 / 勾选单集"""
+        if mode == "全部下载":
+            self.pl_range_container.pack_forget()
+            self.pl_check_toolbar.pack_forget()
+            self.pl_scroll_frame.pack_forget()
+        elif mode == "范围选取":
+            self.pl_check_toolbar.pack_forget()
+            self.pl_scroll_frame.pack_forget()
+            self.pl_range_container.pack(fill="x", padx=10, pady=(0, 5))
+        elif mode == "勾选单集":
+            self.pl_range_container.pack_forget()
+            self.pl_check_toolbar.pack(fill="x", padx=10, pady=(0, 2))
+            self.pl_scroll_frame.pack(fill="both", expand=True, padx=10, pady=(0, 5))
+
+    def _select_all_playlist_items(self):
+        """全选播放列表中的条目"""
+        for var in self.playlist_check_vars:
+            var.set(True)
+        self._update_playlist_count_label()
+
+    def _deselect_all_playlist_items(self):
+        """全不选播放列表中的条目"""
+        for var in self.playlist_check_vars:
+            var.set(False)
+        self._update_playlist_count_label()
+
+    def _update_playlist_count_label(self):
+        """更新勾选计数显示"""
+        selected_count = sum(1 for var in self.playlist_check_vars if var.get())
+        total_count = len(self.playlist_check_vars)
+        self.pl_count_label.configure(
+            text=f"已选择: {selected_count} / {total_count}",
+            text_color="#3498DB" if selected_count > 0 else "gray",
+        )
+
+    def _render_playlist_entries(self):
+        """渲染播放列表条目到可滚动列表区域"""
+        # 清除旧控件
+        for widget in self.pl_scroll_frame.winfo_children():
+            widget.destroy()
+
+        self.playlist_check_vars.clear()
+
+        for entry in self.playlist_entries:
+            idx = entry.get("index", 1)
+            title = entry.get("title", f"视频 {idx}")
+            duration = entry.get("duration_str", "")
+
+            # 条目行容器
+            row_frame = ctk.CTkFrame(self.pl_scroll_frame, fg_color="transparent")
+            row_frame.pack(fill="x", pady=2)
+            row_frame.grid_columnconfigure(1, weight=1)
+
+            # 复选框
+            chk_var = ctk.BooleanVar(value=True)
+            self.playlist_check_vars.append(chk_var)
+
+            chk = ctk.CTkCheckBox(
+                row_frame,
+                text=f"{idx:02d}. {title}",
+                variable=chk_var,
+                font=ctk.CTkFont(size=11),
+                command=self._update_playlist_count_label,
+            )
+            chk.grid(row=0, column=0, columnspan=2, sticky="w", padx=2)
+
+            if duration:
+                dur_lbl = ctk.CTkLabel(
+                    row_frame,
+                    text=duration,
+                    font=ctk.CTkFont(size=10),
+                    text_color="gray",
+                    fg_color=("gray85", "gray25"),
+                    corner_radius=4,
+                    padx=4,
+                    pady=1,
+                )
+                dur_lbl.grid(row=0, column=2, sticky="e", padx=(5, 2))
+
+        self._update_playlist_count_label()
+
+    def _get_selected_playlist_items_param(self):
+        """根据当前播放列表选择模式组装 yt-dlp 的 playlist_items 参数"""
+        if not self.is_playlist:
+            return None
+
+        mode = self.playlist_mode_var.get()
+        if mode == "全部下载":
+            return None
+        elif mode == "范围选取":
+            val = self.playlist_range_var.get().strip()
+            return val if val else None
+        elif mode == "勾选单集":
+            selected_indices = [
+                str(entry.get("index", i + 1))
+                for i, (entry, var) in enumerate(
+                    zip(self.playlist_entries, self.playlist_check_vars, strict=False)
+                )
+                if var.get()
+            ]
+            if not selected_indices:
+                return "0"  # 未勾选任何条目
+            return ",".join(selected_indices)
+
+        return None
+
     # ── 目录选择 ─────────────────────────────────────────────────────────────
     def choose_output_dir(self):
         dir_path = filedialog.askdirectory(initialdir=self.output_dir)
@@ -323,11 +579,16 @@ class App(ctk.CTk):
 
     # ── Cookie 管理 ──────────────────────────────────────────────────────────
     def update_cookie_list(self):
-        if not os.path.exists(self.cookie_dir):
-            os.makedirs(self.cookie_dir)
+        try:
+            if not os.path.exists(self.cookie_dir):
+                os.makedirs(self.cookie_dir, exist_ok=True)
+            files = os.listdir(self.cookie_dir)
+        except OSError as e:
+            self.update_log(f"⚠️ 无法访问 Cookie 目录: {e}")
+            files = []
 
         cookies = ["未选择 (可选)"]
-        for f in os.listdir(self.cookie_dir):
+        for f in files:
             if f.endswith(".txt"):
                 cookies.append(f)
 
@@ -361,8 +622,12 @@ class App(ctk.CTk):
             filetypes=[("Text Files", "*.txt"), ("All Files", "*.*")]
         )
         if file_path:
-            if not os.path.exists(self.cookie_dir):
-                os.makedirs(self.cookie_dir)
+            try:
+                if not os.path.exists(self.cookie_dir):
+                    os.makedirs(self.cookie_dir, exist_ok=True)
+            except OSError as e:
+                self.update_log(f"❌ 创建 Cookie 目录失败: {e}")
+                return
 
             filename = os.path.basename(file_path)
             dest_path = os.path.join(self.cookie_dir, filename)
@@ -504,7 +769,9 @@ class App(ctk.CTk):
             def update_ui():
                 if res["status"] == "success":
                     self.is_playlist = res.get("is_playlist", False)
-                    self.playlist_entries = res.get("entries", [])
+                    self.playlist_entries = res.get("items", []) or res.get(
+                        "entries", []
+                    )
                     self._current_item_info = None
 
                     if self.is_playlist:
@@ -516,7 +783,16 @@ class App(ctk.CTk):
                         self.update_log(
                             f"解析到播放列表/合集: {res['title']} (共 {entry_count} 个视频)"
                         )
+                        # 渲染并展开播放列表交互卡片
+                        self._render_playlist_entries()
+                        self.playlist_mode_var.set("全部下载")
+                        self._on_playlist_mode_change("全部下载")
+                        self.playlist_frame.grid(
+                            row=2, column=0, padx=10, pady=(0, 5), sticky="ew"
+                        )
                     else:
+                        # 隐藏播放列表卡片
+                        self.playlist_frame.grid_forget()
                         self.title_label.configure(
                             text=f"📌 {res['title']}", text_color="#2CC985"
                         )
@@ -591,10 +867,51 @@ class App(ctk.CTk):
 
         threading.Thread(target=fetch_task, daemon=True).start()
 
-    # ── 开始下载 ─────────────────────────────────────────────────────────────
+    def open_dependency_settings(self):
+        """打开依赖设置/引导弹窗"""
+        if self.ffmpeg_location and self.ffmpeg_type != "未检测到":
+            self.update_log(
+                f"ℹ️ 当前 FFmpeg 就绪状态: {self.ffmpeg_type} (路径: {self.ffmpeg_location})"
+            )
+        else:
+            self.update_log(
+                "⚠️ 未检测到 FFmpeg 引擎，请执行 pip install imageio-ffmpeg 或安装系统 FFmpeg。"
+            )
+
+    def on_dependency_updated(self, path, source):
+        """当依赖发生更新时刷新界面状态与下载器配置"""
+        self.ffmpeg_location = path
+        self.ffmpeg_type = source
+        self.downloader.ffmpeg_location = path
+
+        ffmpeg_is_ok = (
+            self.ffmpeg_location is not None and self.ffmpeg_type != "未检测到"
+        )
+        badge_text = f"⚙️ FFmpeg: {self.ffmpeg_type}"
+        badge_fg = ("#D4EDDA", "#1E3A2F") if ffmpeg_is_ok else ("#F8D7DA", "#3E2723")
+        badge_text_color = (
+            ("#155724", "#4CAF50") if ffmpeg_is_ok else ("#721C24", "#EF5350")
+        )
+
+        self.ffmpeg_badge.configure(
+            text=badge_text,
+            fg_color=badge_fg,
+            text_color=badge_text_color,
+            hover_color=badge_fg,
+        )
+        if ffmpeg_is_ok:
+            self.update_log(f"✅ FFmpeg 依赖已就绪: {self.ffmpeg_type} -> {path}")
+        else:
+            self.update_log("⚠️ 当前未检测到可用 FFmpeg 引擎。")
+
     def on_download(self):
         if self._is_downloading:
             return
+
+        if not self.ffmpeg_location or self.ffmpeg_type == "未检测到":
+            self.update_log(
+                "⚠️ 提示: 缺少 FFmpeg 引擎可能导致部分清晰度合并或转码失败，点击右上角【⚙️ FFmpeg】可配置。"
+            )
 
         if self.fetch_btn.cget("state") == "disabled":
             self.update_log("错误: 请等待解析完成后再开始下载。")
@@ -621,6 +938,22 @@ class App(ctk.CTk):
         subtitle_lang = self.s_opts_map.get(s_desc, None)  # None = 无字幕
         subtitle_embed = self.sub_mode_var.get() == "嵌入视频"
 
+        # 播放列表选集过滤
+        playlist_items_param = (
+            self._get_selected_playlist_items_param() if self.is_playlist else None
+        )
+        if (
+            self.is_playlist
+            and self.playlist_mode_var.get() == "勾选单集"
+            and playlist_items_param == "0"
+        ):
+            self.update_log("错误: 请至少勾选一个要下载的视频条目。")
+            return
+
+        # 高级设置：断点续传与缓存保留
+        keep_cache = self.resume_download_var.get()
+        cleanup_on_cancel = not keep_cache
+
         self._is_downloading = True
         self.download_btn.configure(state="disabled", text="下 载 中 ...")
         self.cancel_btn.configure(state="normal")
@@ -631,15 +964,19 @@ class App(ctk.CTk):
             self.update_log("\n--- 开始下载任务 ---")
             self.update_log(f"URL: {url}")
             if self.is_playlist:
-                self.update_log(
-                    f"任务类型: 播放列表/合集批量下载 (共 {len(self.playlist_entries)} 集)"
-                )
+                mode_name = self.playlist_mode_var.get()
+                self.update_log(f"任务类型: 播放列表/合集批量下载 (模式: {mode_name})")
+                if playlist_items_param:
+                    self.update_log(f"选集范围/序号: {playlist_items_param}")
             self.update_log(f"视频选项: {v_desc}")
             self.update_log(f"音频选项: {a_desc}")
             self.update_log(f"输出格式: {format_type}")
             if subtitle_lang:
                 mode_str = "嵌入视频" if subtitle_embed else "单独下载"
                 self.update_log(f"字幕语言: {s_desc} ({mode_str})")
+            self.update_log(
+                f"断点续传: {'开启 (保留未完成缓存)' if keep_cache else '关闭'}"
+            )
             self.update_log(f"保存至: {self.output_dir}")
 
             res = self.downloader.download(
@@ -652,7 +989,8 @@ class App(ctk.CTk):
                 subtitle_lang=subtitle_lang,
                 subtitle_embed=subtitle_embed,
                 is_playlist=self.is_playlist,
-                cleanup_on_cancel=False,
+                playlist_items=playlist_items_param,
+                cleanup_on_cancel=cleanup_on_cancel,
             )
 
             def update_ui():

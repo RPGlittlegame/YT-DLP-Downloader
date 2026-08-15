@@ -1,12 +1,15 @@
 # -*- mode: python ; coding: utf-8 -*-
 import os
 
+edition = os.environ.get('YDD_BUILD_EDITION', 'slim').lower()
+
 datas = [
     ('YDD.icon/icon.ico', 'YDD.icon/'),
     ('YDD.icon/Assets/square.and.arrow.down.fill.png', 'YDD.icon/Assets/'),
 ]
 
-if os.path.exists('bin/ffmpeg.exe'):
+# 仅在 full 版本且本地存在 bin/ffmpeg.exe 时内置打包
+if edition == 'full' and os.path.exists('bin/ffmpeg.exe'):
     datas.append(('bin/ffmpeg.exe', 'bin/'))
 
 a = Analysis(
@@ -14,7 +17,7 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=datas,
-    hiddenimports=['PIL', 'PIL.Image', 'imageio_ffmpeg'],
+    hiddenimports=['PIL', 'PIL.Image', 'customtkinter', 'yt_dlp'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
