@@ -19,7 +19,7 @@ z# YT-DLP Downloader
 
 ## 📖 新手使用教程（三种版本如何选择与使用）
 
-我们为你提供了三种使用方式，请根据你的需求选择最适合的一种：
+提供了三种使用方式，请根据你的需求选择最适合的一种：
 
 ```
                     ┌──────────────────────────────┐
@@ -114,4 +114,4 @@ z# YT-DLP Downloader
 
 ## 🚀 开发方式 (Built with Vibe Coding)
 
-本项目由开使用 **Antigravity Vibe Coding** 
+本项目使用 **Google Antigravity** 开发
