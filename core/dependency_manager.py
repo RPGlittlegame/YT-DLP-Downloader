@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import glob
 import importlib
 import importlib.util
 import json
@@ -128,14 +129,123 @@ class DependencyManager:
         except Exception as e:
             return False, f"执行失败: {e}"
 
+    @staticmethod
+    def _find_common_system_ffmpeg() -> str | None:
+        """
+        全盘深度扫描操作系统常见安装路径、包管理器路径及全局 Python 环境下的 FFmpeg
+        解决 macOS/Linux 打包 GUI 应用未继承终端 PATH 或使用独立虚拟环境无法检测到的痛点
+        """
+        home = os.path.expanduser("~")
+        candidate_paths: list[str] = []
+
+        if sys.platform == "darwin":
+            # 1. macOS 常见包管理器与工具链路径
+            candidate_paths.extend([
+                "/opt/homebrew/bin/ffmpeg",
+                "/opt/homebrew/sbin/ffmpeg",
+                "/usr/local/bin/ffmpeg",
+                "/usr/local/sbin/ffmpeg",
+                "/opt/local/bin/ffmpeg",
+                "/opt/local/sbin/ffmpeg",
+                "/Applications/FFmpeg/ffmpeg",
+                "/Applications/ffmpeg",
+                os.path.join(home, "bin", "ffmpeg"),
+                os.path.join(home, ".local", "bin", "ffmpeg"),
+                os.path.join(home, "miniconda3", "bin", "ffmpeg"),
+                os.path.join(home, "anaconda3", "bin", "ffmpeg"),
+                os.path.join(home, "miniforge3", "bin", "ffmpeg"),
+                os.path.join(home, ".pyenv", "shims", "ffmpeg"),
+            ])
+            # 2. 扫描系统全局及主流 Python 环境中的 imageio_ffmpeg 二进制
+            imageio_patterns = [
+                os.path.join(home, ".local", "lib", "python*", "site-packages", "imageio_ffmpeg", "binaries", "ffmpeg*"),
+                os.path.join(home, "Library", "Python", "*", "lib", "python", "site-packages", "imageio_ffmpeg", "binaries", "ffmpeg*"),
+                "/Library/Frameworks/Python.framework/Versions/*/lib/python*/site-packages/imageio_ffmpeg/binaries/ffmpeg*",
+                "/opt/homebrew/lib/python*/site-packages/imageio_ffmpeg/binaries/ffmpeg*",
+                "/usr/local/lib/python*/site-packages/imageio_ffmpeg/binaries/ffmpeg*",
+                os.path.join(home, "miniconda3", "lib", "python*", "site-packages", "imageio_ffmpeg", "binaries", "ffmpeg*"),
+                os.path.join(home, "anaconda3", "lib", "python*", "site-packages", "imageio_ffmpeg", "binaries", "ffmpeg*"),
+                os.path.join(home, "miniforge3", "lib", "python*", "site-packages", "imageio_ffmpeg", "binaries", "ffmpeg*"),
+            ]
+            for pat in imageio_patterns:
+                for f in glob.glob(pat):
+                    if not f.endswith((".py", ".pyc", ".md")) and os.path.isfile(f):
+                        candidate_paths.append(f)
+
+        elif sys.platform == "win32":
+            localappdata = os.environ.get("LOCALAPPDATA", os.path.join(home, "AppData", "Local"))
+            appdata = os.environ.get("APPDATA", os.path.join(home, "AppData", "Roaming"))
+            progdata = os.environ.get("PROGRAMDATA", r"C:\ProgramData")
+            progfiles = os.environ.get("PROGRAMFILES", r"C:\Program Files")
+            progfiles86 = os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")
+
+            candidate_paths.extend([
+                os.path.join(progdata, "chocolatey", "bin", "ffmpeg.exe"),
+                os.path.join(home, "scoop", "shims", "ffmpeg.exe"),
+                os.path.join(home, "scoop", "apps", "ffmpeg", "current", "bin", "ffmpeg.exe"),
+                os.path.join(localappdata, "Programs", "ffmpeg", "bin", "ffmpeg.exe"),
+                os.path.join(home, "miniconda3", "Library", "bin", "ffmpeg.exe"),
+                os.path.join(home, "anaconda3", "Library", "bin", "ffmpeg.exe"),
+                r"C:\ffmpeg\bin\ffmpeg.exe",
+                r"C:\tools\ffmpeg\bin\ffmpeg.exe",
+                os.path.join(progfiles, "ffmpeg", "bin", "ffmpeg.exe"),
+                os.path.join(progfiles86, "ffmpeg", "bin", "ffmpeg.exe"),
+            ])
+            # WinGet Packages 搜索
+            winget_pattern = os.path.join(localappdata, "Microsoft", "WinGet", "Packages", "*", "ffmpeg.exe")
+            candidate_paths.extend(glob.glob(winget_pattern))
+
+            # Windows Python imageio_ffmpeg 搜索
+            imageio_patterns_win = [
+                os.path.join(localappdata, "Programs", "Python", "Python*", "Lib", "site-packages", "imageio_ffmpeg", "binaries", "ffmpeg*.exe"),
+                os.path.join(appdata, "Python", "Python*", "site-packages", "imageio_ffmpeg", "binaries", "ffmpeg*.exe"),
+                r"C:\Python*\Lib\site-packages\imageio_ffmpeg\binaries\ffmpeg*.exe",
+            ]
+            for pat in imageio_patterns_win:
+                candidate_paths.extend(glob.glob(pat))
+
+        else:
+            # Linux 环境
+            candidate_paths.extend([
+                "/usr/bin/ffmpeg",
+                "/usr/local/bin/ffmpeg",
+                "/snap/bin/ffmpeg",
+                "/var/lib/flatpak/exports/bin/ffmpeg",
+                os.path.join(home, "bin", "ffmpeg"),
+                os.path.join(home, ".local", "bin", "ffmpeg"),
+                os.path.join(home, "miniconda3", "bin", "ffmpeg"),
+                os.path.join(home, "anaconda3", "bin", "ffmpeg"),
+            ])
+            imageio_patterns_linux = [
+                os.path.join(home, ".local", "lib", "python*", "site-packages", "imageio_ffmpeg", "binaries", "ffmpeg*"),
+                "/usr/local/lib/python*/dist-packages/imageio_ffmpeg/binaries/ffmpeg*",
+                "/usr/lib/python*/dist-packages/imageio_ffmpeg/binaries/ffmpeg*",
+            ]
+            for pat in imageio_patterns_linux:
+                for f in glob.glob(pat):
+                    if not f.endswith((".py", ".pyc", ".md")) and os.path.isfile(f):
+                        candidate_paths.append(f)
+
+        # 检查候选路径并去重验证
+        seen = set()
+        for cand in candidate_paths:
+            norm_cand = os.path.normpath(cand)
+            if norm_cand not in seen and os.path.exists(norm_cand) and os.path.isfile(norm_cand):
+                seen.add(norm_cand)
+                valid, _ = DependencyManager.verify_executable(norm_cand)
+                if valid:
+                    return norm_cand
+        return None
+
     def detect_ffmpeg(self) -> dict[str, str | None]:
         """
         多级探测 FFmpeg 依赖可用性：
         1. 用户自定义配置 (Custom)
         2. 系统 PATH 环境 (System PATH)
-        3. 应用本地数据缓存目录 (~/.ydd/bin/ffmpeg)
-        4. 打包内置 bin/ 目录 (Bundled bin)
-        5. Python 静态库 imageio_ffmpeg
+        3. 打包内置 / 本地应用 bin/ 目录 (Bundled bin)
+        4. 当前 Python 环境静态库 imageio_ffmpeg
+        5. 全局系统标准路径与主流包管理器/Python安装 (Homebrew / Winget / Conda / imageio)
+        6. 应用本地数据缓存目录 (~/.ydd/bin/ffmpeg)
         """
         ffmpeg_name = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
 
@@ -162,19 +272,7 @@ class DependencyManager:
                     "info": info,
                 }
 
-        # 3. 检查应用本地缓存目录 ~/.ydd/bin/
-        cached_bin = os.path.join(self.bin_cache_dir, ffmpeg_name)
-        if os.path.exists(cached_bin):
-            valid, info = self.verify_executable(cached_bin)
-            if valid:
-                return {
-                    "path": cached_bin,
-                    "source": "本地缓存 (一键安装)",
-                    "status": "ok",
-                    "info": info,
-                }
-
-        # 4. 检查打包内置 / bin/ 目录
+        # 3. 检查打包内置 / bin/ 目录
         if getattr(sys, "frozen", False):
             base_dir = getattr(
                 sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))
@@ -192,7 +290,7 @@ class DependencyManager:
                     "info": info,
                 }
 
-        # 5. 检查 imageio_ffmpeg 静态库
+        # 4. 检查当前 Python 环境静态库 imageio_ffmpeg
         if importlib.util.find_spec("imageio_ffmpeg") is not None:
             try:
                 imageio_ffmpeg_mod = importlib.import_module("imageio_ffmpeg")
@@ -210,6 +308,31 @@ class DependencyManager:
                             }
             except Exception:
                 pass
+
+        # 5. 深度扫描系统与全盘常见路径 (Homebrew / Conda / Winget / 全局 imageio-ffmpeg)
+        deep_found = self._find_common_system_ffmpeg()
+        if deep_found:
+            valid, info = self.verify_executable(deep_found)
+            if valid:
+                source_label = "系统安装 (Homebrew/系统工具)" if "homebrew" in deep_found.lower() else "本地发现 (全盘探测)"
+                return {
+                    "path": deep_found,
+                    "source": source_label,
+                    "status": "ok",
+                    "info": info,
+                }
+
+        # 6. 检查应用本地缓存目录 ~/.ydd/bin/
+        cached_bin = os.path.join(self.bin_cache_dir, ffmpeg_name)
+        if os.path.exists(cached_bin):
+            valid, info = self.verify_executable(cached_bin)
+            if valid:
+                return {
+                    "path": cached_bin,
+                    "source": "本地缓存 (一键安装)",
+                    "status": "ok",
+                    "info": info,
+                }
 
         return {
             "path": None,

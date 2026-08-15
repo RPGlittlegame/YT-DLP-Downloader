@@ -6,7 +6,10 @@ YT-DLP Downloader 双轨自动构建脚本
   --edition full (完整版: 内置当前平台的静态 FFmpeg 二进制, 100% 离线开箱即用, ~50MB)
 """
 
+from __future__ import annotations
+
 import argparse
+import contextlib
 import os
 import platform
 import shutil
@@ -27,6 +30,17 @@ def parse_args():
         action="store_true",
         help="打包前清理 build/ 和 dist/ 缓存",
     )
+    parser.add_argument(
+        "--dmg",
+        action="store_true",
+        help="在 macOS 下自动生成 .dmg 安装镜像",
+    )
+    parser.add_argument(
+        "--dmg-dir",
+        type=str,
+        default="",
+        help="指定 .dmg 文件的输出目录（默认为 dist/）",
+    )
     return parser.parse_args()
 
 
@@ -34,16 +48,16 @@ def safe_makedirs(path: str):
     """安全创建目录并忽略异常"""
     try:
         os.makedirs(path, exist_ok=True)
-    except OSError:
-        pass
+    except Exception as e:
+        _ = e
 
 
 def safe_rmtree(path: str):
     """安全删除目录并忽略异常"""
     try:
         shutil.rmtree(path)
-    except OSError:
-        pass
+    except Exception as e:
+        _ = e
 
 
 def prepare_environment(edition: str) -> dict:
@@ -81,7 +95,63 @@ def prepare_environment(edition: str) -> dict:
     return env
 
 
-def run_build(edition: str, clean: bool = False):
+def create_macos_dmg(edition: str, app_path: str, output_dir: str) -> str:
+    """在 macOS 下将 .app 打包为 DMG 镜像并输出到指定目录"""
+    dmg_name = f"YT-DLP_Downloader_{edition.capitalize()}_macOS.dmg"
+    final_dmg_path = os.path.join(output_dir, dmg_name)
+
+    print(f"[*] 正在为 {edition.upper()} 版本创建 macOS DMG 镜像...")
+
+    # 创建用于组装 DMG 根目录的临时文件夹
+    temp_dmg_src = os.path.join(os.path.dirname(app_path), f"dmg_temp_{edition}")
+    safe_rmtree(temp_dmg_src)
+    safe_makedirs(temp_dmg_src)
+
+    try:
+        # 拷贝 .app 到临时目录
+        target_app = os.path.join(temp_dmg_src, "YT-DLP_Downloader.app")
+        shutil.copytree(app_path, target_app, symlinks=True)
+
+        # 创建 /Applications 快捷方式软链接，方便用户拖拽安装
+        apps_link = os.path.join(temp_dmg_src, "Applications")
+        if not os.path.exists(apps_link):
+            os.symlink("/Applications", apps_link)
+
+        # 如果已有同名 dmg，先删除
+        if os.path.exists(final_dmg_path):
+            with contextlib.suppress(OSError):
+                os.remove(final_dmg_path)
+
+        # 使用 hdiutil 创建 UDZO 压缩镜像
+        cmd = [
+            "hdiutil",
+            "create",
+            "-volname",
+            f"YT-DLP Downloader ({edition.capitalize()})",
+            "-srcfolder",
+            temp_dmg_src,
+            "-ov",
+            "-format",
+            "UDZO",
+            final_dmg_path,
+        ]
+        ret = subprocess.run(cmd, capture_output=True, text=True)
+        if ret.returncode != 0:
+            print(f"[!] 创建 DMG 失败: {ret.stderr}")
+            return ""
+
+        print(f"[✓] DMG 制作成功: {final_dmg_path}")
+        return final_dmg_path
+    finally:
+        safe_rmtree(temp_dmg_src)
+
+
+def run_build(
+    edition: str,
+    clean: bool = False,
+    create_dmg: bool = False,
+    target_dmg_dir: str | None = None,
+):
     root_dir = os.path.dirname(os.path.abspath(__file__))
     system = platform.system()
 
@@ -110,7 +180,18 @@ def run_build(edition: str, clean: bool = False):
 
     print(f"[✓] 构建完成！产物位于 dist/ 目录。版本模式: {edition.upper()}")
 
+    if system == "Darwin" and create_dmg:
+        app_path = os.path.join(root_dir, "dist", "YT-DLP_Downloader.app")
+        dmg_out_dir = target_dmg_dir or os.path.join(root_dir, "dist")
+        safe_makedirs(dmg_out_dir)
+        create_macos_dmg(edition, app_path, dmg_out_dir)
+
 
 if __name__ == "__main__":
     args = parse_args()
-    run_build(edition=args.edition, clean=args.clean)
+    run_build(
+        edition=args.edition,
+        clean=args.clean,
+        create_dmg=args.dmg,
+        target_dmg_dir=args.dmg_dir or None,
+    )
