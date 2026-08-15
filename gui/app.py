@@ -1,8 +1,11 @@
+from __future__ import annotations
+
 import os
 import shutil
 import sys
 import threading
 from tkinter import filedialog
+from typing import Any
 
 import customtkinter as ctk
 from PIL import Image, ImageTk
@@ -30,7 +33,7 @@ class App(ctk.CTk):
         # 窗口配置
         self.title("YT-DLP Downloader")
         self.geometry("680x760")
-        self.minsize(580, 680)
+        self.minsize(580, 520)
 
         # 设置应用图标
         self._set_app_icon()
@@ -40,13 +43,15 @@ class App(ctk.CTk):
         # row 1: 选项设置 (weight=0)
         # row 2: 播放列表卡片 (weight=0)
         # row 3: 开始下载按钮 (weight=0, 保证绝不被遮挡或压缩)
-        # row 4: 进度与日志区 (weight=1, 吸收剩余窗口拉伸)
+        # row 4: 进度条与状态 (weight=0, 保证窗口缩小时始终完整可见)
+        # row 5: 日志区 (weight=1, 吸收剩余窗口拉伸，极限缩小时可收缩到看不见)
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(0, weight=0)
         self.grid_rowconfigure(1, weight=0)
         self.grid_rowconfigure(2, weight=0)
         self.grid_rowconfigure(3, weight=0)
-        self.grid_rowconfigure(4, weight=1)
+        self.grid_rowconfigure(4, weight=0)
+        self.grid_rowconfigure(5, weight=1)
 
         # 默认值及状态变量初始化（必须在 create_widgets 前完成）
         self.output_dir = os.path.expanduser("~/Downloads")
@@ -78,6 +83,9 @@ class App(ctk.CTk):
 
         # 初始化状态
         self._is_downloading = False
+        self._is_fetching = False
+        self._download_thread: threading.Thread | None = None
+        self._is_closing = False
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
         # 初始化 cookie 列表
@@ -108,9 +116,31 @@ class App(ctk.CTk):
 
     # ── 关闭处理 ─────────────────────────────────────────────────────────────
     def on_closing(self):
+        """窗口关闭处理：防重复触发，并在有后台任务时优雅等待中止"""
+        if self._is_closing:
+            return
+        self._is_closing = True
+
         if self._is_downloading:
             self.downloader.cancel_download()
-        self.destroy()
+            self.update_log("正在中止后台任务并退出...")
+            # 隐藏主窗口避免用户继续点击触发其它操作
+            self.withdraw()
+
+            def _wait_and_destroy(retry_count=0):
+                # 如果下载线程已安全退出，或者超时（15次 * 100ms = 1.5s），强制销毁退出
+                if (
+                    self._download_thread is None
+                    or not self._download_thread.is_alive()
+                    or retry_count >= 15
+                ):
+                    self.destroy()
+                else:
+                    self.after(100, lambda: _wait_and_destroy(retry_count + 1))
+
+            self.after(50, _wait_and_destroy)
+        else:
+            self.destroy()
 
     # ── 界面构建 ─────────────────────────────────────────────────────────────
     def create_widgets(self):
@@ -131,6 +161,7 @@ class App(ctk.CTk):
             corner_radius=6,
         )
         self.url_entry.grid(row=0, column=1, padx=(0, 5), pady=5, sticky="ew")
+        self.url_entry.bind("<Return>", lambda event: self.on_fetch())
 
         self.fetch_btn = ctk.CTkButton(
             self.top_frame,
@@ -392,9 +423,9 @@ class App(ctk.CTk):
         )
         self.pl_count_label.grid(row=0, column=2, padx=(5, 10), sticky="e")
 
-        # 勾选单集滚动列表 (限制高度为 110px，避免条目过多时挤占底部操作栏)
+        # 勾选单集滚动列表 (限制高度为 85px，避免条目填满时挤占底部操作栏与进度条)
         self.pl_scroll_frame = ctk.CTkScrollableFrame(
-            self.playlist_frame, height=110, corner_radius=6
+            self.playlist_frame, height=85, corner_radius=6
         )
         self.pl_scroll_frame.grid_columnconfigure(1, weight=1)
 
@@ -439,27 +470,27 @@ class App(ctk.CTk):
         )
         self.cancel_btn.grid(row=1, column=1, sticky="e")
 
-        # --- 进度与日志区 (位于 row 4，weight=1 自动适配剩余高度) ---
-        self.log_frame = ctk.CTkFrame(self, corner_radius=10)
-        self.log_frame.grid(row=4, column=0, padx=10, pady=(5, 10), sticky="nsew")
-        self.log_frame.grid_columnconfigure(0, weight=1)
-        self.log_frame.grid_rowconfigure(2, weight=1)
+        # --- 进度条与状态区 (位于 row 4，weight=0 保证窗口高度最小时始终包含) ---
+        self.progress_frame = ctk.CTkFrame(self, corner_radius=10)
+        self.progress_frame.grid(row=4, column=0, padx=10, pady=(5, 5), sticky="ew")
+        self.progress_frame.grid_columnconfigure(0, weight=1)
 
-        self.progress_bar = ctk.CTkProgressBar(self.log_frame, corner_radius=6)
+        self.progress_bar = ctk.CTkProgressBar(self.progress_frame, corner_radius=6)
         self.progress_bar.grid(row=0, column=0, padx=10, pady=(10, 5), sticky="ew")
         self.progress_bar.set(0)
 
         self.status_label = ctk.CTkLabel(
-            self.log_frame, text="准备就绪", font=ctk.CTkFont(size=11)
+            self.progress_frame, text="准备就绪", font=ctk.CTkFont(size=11)
         )
-        self.status_label.grid(row=1, column=0, pady=(0, 5))
+        self.status_label.grid(row=1, column=0, pady=(0, 8))
 
+        # --- 日志区 (位于 row 5，weight=1 吸收剩余高度，窗口高度最小时可收缩至隐藏) ---
         self.log_box = ctk.CTkTextbox(
-            self.log_frame,
-            corner_radius=6,
+            self,
+            corner_radius=10,
             font=ctk.CTkFont(family="Consolas", size=11),
         )
-        self.log_box.grid(row=2, column=0, padx=10, pady=(5, 10), sticky="nsew")
+        self.log_box.grid(row=5, column=0, padx=10, pady=(0, 10), sticky="nsew")
         self.log_box.configure(state="disabled")
 
     # ── 播放列表控制逻辑 ─────────────────────────────────────────────────────
@@ -753,115 +784,134 @@ class App(ctk.CTk):
 
     # ── 解析视频 ─────────────────────────────────────────────────────────────
     def on_fetch(self):
+        if self._is_fetching or self._is_closing:
+            return
+
         url = self.url_entry.get().strip()
         if not url:
             self.update_log("错误: 请输入有效的 URL。")
             return
 
+        self._is_fetching = True
         self.fetch_btn.configure(state="disabled")
         self.title_label.configure(text="正在解析中，请稍候...", text_color="white")
         self.update_log(f"开始解析: {url}")
         self.size_label.configure(text="📦 预估大小: 解析中...", text_color="gray")
 
         def fetch_task():
-            res = self.downloader.fetch_info(url, self.cookie_file)
+            res: dict[str, Any]
+            try:
+                res = self.downloader.fetch_info(url, self.cookie_file)
+            except Exception as e:
+                res = {"status": "error", "message": str(e)}
 
             def update_ui():
-                if res["status"] == "success":
-                    self.is_playlist = res.get("is_playlist", False)
-                    self.playlist_entries = res.get("items", []) or res.get(
-                        "entries", []
-                    )
-                    self._current_item_info = None
+                try:
+                    if res.get("status") == "success":
+                        self.is_playlist = bool(res.get("is_playlist", False))
+                        self.playlist_entries = res.get("items", []) or res.get(
+                            "entries", []
+                        )
+                        self._current_item_info = None
 
-                    if self.is_playlist:
-                        entry_count = len(self.playlist_entries)
-                        self.title_label.configure(
-                            text=f"📑 [播放列表/合集] {res['title']} (共 {entry_count} 个视频)",
-                            text_color="#3498DB",
-                        )
-                        self.update_log(
-                            f"解析到播放列表/合集: {res['title']} (共 {entry_count} 个视频)"
-                        )
-                        # 渲染并展开播放列表交互卡片
-                        self._render_playlist_entries()
-                        self.playlist_mode_var.set("全部下载")
-                        self._on_playlist_mode_change("全部下载")
-                        self.playlist_frame.grid(
-                            row=2, column=0, padx=10, pady=(0, 5), sticky="ew"
-                        )
-                    else:
-                        # 隐藏播放列表卡片
-                        self.playlist_frame.grid_forget()
-                        self.title_label.configure(
-                            text=f"📌 {res['title']}", text_color="#2CC985"
-                        )
-                        self.update_log(f"解析成功: {res['title']}")
+                        if self.is_playlist:
+                            entry_count = len(self.playlist_entries)
+                            self.title_label.configure(
+                                text=f"📑 [播放列表/合集] {res['title']} (共 {entry_count} 个视频)",
+                                text_color="#3498DB",
+                            )
+                            self.update_log(
+                                f"解析到播放列表/合集: {res['title']} (共 {entry_count} 个视频)"
+                            )
+                            # 渲染并展开播放列表交互卡片
+                            self._render_playlist_entries()
+                            self.playlist_mode_var.set("全部下载")
+                            self._on_playlist_mode_change("全部下载")
+                            self.playlist_frame.grid(
+                                row=2, column=0, padx=10, pady=(0, 5), sticky="ew"
+                            )
+                        else:
+                            # 隐藏播放列表卡片
+                            self.playlist_frame.grid_forget()
+                            self.title_label.configure(
+                                text=f"📌 {res['title']}", text_color="#2CC985"
+                            )
+                            self.update_log(f"解析成功: {res['title']}")
 
-                    # 重置映射表
-                    self.v_opts_map = {
-                        "自动 (Best)": {"id": "best", "filesize": None},
-                        "无 (仅音频)": {"id": "none", "filesize": None},
-                    }
-                    self.a_opts_map = {
-                        "自动 (Best)": {"id": "best", "filesize": None},
-                        "无 (仅视频)": {"id": "none", "filesize": None},
-                    }
-                    self.s_opts_map = {"无字幕": None}
-
-                    v_vals = ["自动 (Best)", "无 (仅音频)"]
-                    for vo in res.get("video_opts", []):
-                        v_vals.append(vo["desc"])
-                        self.v_opts_map[vo["desc"]] = {
-                            "id": vo["id"],
-                            "filesize": vo.get("filesize"),
+                        # 重置映射表
+                        self.v_opts_map = {
+                            "自动 (Best)": {"id": "best", "filesize": None},
+                            "无 (仅音频)": {"id": "none", "filesize": None},
                         }
-
-                    a_vals = ["自动 (Best)", "无 (仅视频)"]
-                    for ao in res.get("audio_opts", []):
-                        a_vals.append(ao["desc"])
-                        self.a_opts_map[ao["desc"]] = {
-                            "id": ao["id"],
-                            "filesize": ao.get("filesize"),
+                        self.a_opts_map = {
+                            "自动 (Best)": {"id": "best", "filesize": None},
+                            "无 (仅视频)": {"id": "none", "filesize": None},
                         }
+                        self.s_opts_map = {"无字幕": None}
 
-                    # 填充字幕下拉框
-                    s_vals = ["无字幕"]
-                    for so in res.get("subtitle_opts", []):
-                        s_vals.append(so["desc"])
-                        self.s_opts_map[so["desc"]] = so["lang"]
+                        v_vals = ["自动 (Best)", "无 (仅音频)"]
+                        for vo in res.get("video_opts", []):
+                            if isinstance(vo, dict):
+                                v_vals.append(str(vo.get("desc", "")))
+                                self.v_opts_map[str(vo.get("desc", ""))] = {
+                                    "id": str(vo.get("id", "")),
+                                    "filesize": vo.get("filesize"),
+                                }
 
-                    self.v_quality_combo.configure(values=v_vals)
-                    self.a_quality_combo.configure(values=a_vals)
-                    self.sub_combo.configure(values=s_vals)
+                        a_vals = ["自动 (Best)", "无 (仅视频)"]
+                        for ao in res.get("audio_opts", []):
+                            if isinstance(ao, dict):
+                                a_vals.append(str(ao.get("desc", "")))
+                                self.a_opts_map[str(ao.get("desc", ""))] = {
+                                    "id": str(ao.get("id", "")),
+                                    "filesize": ao.get("filesize"),
+                                }
 
-                    self.v_quality_var.set("自动 (Best)")
-                    self.a_quality_var.set("自动 (Best)")
-                    self.sub_var.set("无字幕")
-                    self.sub_mode_btn.configure(state="disabled")
+                        # 填充字幕下拉框
+                        s_vals = ["无字幕"]
+                        for so in res.get("subtitle_opts", []):
+                            if isinstance(so, dict):
+                                s_vals.append(str(so.get("desc", "")))
+                                self.s_opts_map[str(so.get("desc", ""))] = so.get(
+                                    "lang"
+                                )
 
-                    # 有字幕时提示
-                    sub_count = len(res.get("subtitle_opts", []))
-                    if sub_count > 0:
-                        self.update_log(
-                            f"✅ 检测到 {sub_count} 个字幕轨道，可在字幕选项中选择。"
-                        )
+                        self.v_quality_combo.configure(values=v_vals)
+                        self.a_quality_combo.configure(values=a_vals)
+                        self.sub_combo.configure(values=s_vals)
+
+                        self.v_quality_var.set("自动 (Best)")
+                        self.a_quality_var.set("自动 (Best)")
+                        self.sub_var.set("无字幕")
+                        self.sub_mode_btn.configure(state="disabled")
+
+                        # 有字幕时提示
+                        sub_count = len(res.get("subtitle_opts", []))
+                        if sub_count > 0:
+                            self.update_log(
+                                f"✅ 检测到 {sub_count} 个字幕轨道，可在字幕选项中选择。"
+                            )
+                        else:
+                            self.update_log("ℹ️ 该视频暂无可用字幕。")
+
+                        # 立即计算一次预估大小
+                        self.update_size_estimate()
+
                     else:
-                        self.update_log("ℹ️ 该视频暂无可用字幕。")
-
-                    # 立即计算一次预估大小
-                    self.update_size_estimate()
-
-                else:
-                    self.is_playlist = False
-                    self.playlist_entries = []
-                    self._current_item_info = None
-                    self.title_label.configure(text="解析失败", text_color="#FF4A4A")
-                    self.update_log(f"解析失败: {res.get('message')}")
-                    self.size_label.configure(
-                        text="📦 预估大小: 解析后显示", text_color="gray"
-                    )
-                self.fetch_btn.configure(state="normal")
+                        self.is_playlist = False
+                        self.playlist_entries = []
+                        self._current_item_info = None
+                        self.title_label.configure(
+                            text="解析失败", text_color="#FF4A4A"
+                        )
+                        self.update_log(f"解析失败: {res.get('message')}")
+                        self.size_label.configure(
+                            text="📦 预估大小: 解析后显示", text_color="gray"
+                        )
+                finally:
+                    self._is_fetching = False
+                    if not self._is_closing:
+                        self.fetch_btn.configure(state="normal")
 
             self.after(0, update_ui)
 
@@ -1010,4 +1060,5 @@ class App(ctk.CTk):
 
             self.after(0, update_ui)
 
-        threading.Thread(target=download_task, daemon=True).start()
+        self._download_thread = threading.Thread(target=download_task, daemon=True)
+        self._download_thread.start()

@@ -1,6 +1,9 @@
+from __future__ import annotations
+
 import os
 import re
 import threading
+from pathlib import Path
 
 import yt_dlp
 from yt_dlp.utils import DownloadCancelled
@@ -50,6 +53,60 @@ class YTDlpDownloader:
         # 记录当前下载的进度状态与取消事件
         self._cancel_event = threading.Event()
         self._current_filenames = set()
+
+    def format_error_message(self, err: BaseException | str) -> str:
+        """将 yt-dlp 产生的异常信息解析为用户友好的提示信息"""
+        msg = str(err)
+        # 去除 ANSI 终端颜色控制码
+        clean_msg = _ANSI_ESCAPE.sub("", msg).strip()
+
+        # 常见错误特征匹配与分类引导
+        if "HTTP Error 403" in clean_msg or "Forbidden" in clean_msg:
+            return (
+                "请求被服务器拒绝 (HTTP 403 Forbidden)。\n"
+                "💡 建议：该网站可能有反爬或防盗链限制，请尝试在上方配置对应的 Cookie 文件后再试。"
+            )
+        elif (
+            "Sign in to confirm you’re not a bot" in clean_msg
+            or "Sign in to confirm your age" in clean_msg
+            or "login" in clean_msg.lower()
+        ):
+            return (
+                "需要登录验证 (年龄限制 / 人机验证 / 会员专享)。\n"
+                "💡 建议：请在浏览器中登录该网站，导出 cookies.txt 放入 cookies/ 目录并选用后重试。"
+            )
+        elif (
+            clean_msg.find("This video is not available") != -1
+            or clean_msg.find("Video unavailable") != -1
+        ):
+            return (
+                "视频不可用。\n"
+                "💡 建议：视频可能已被作者删除、设为私享或在当前地区受限 (Geo-restricted)。"
+            )
+        elif "Unsupported URL" in clean_msg:
+            return "不支持的链接格式。\n💡 建议：请检查输入的 URL 是否完整且正确。"
+        elif "ffmpeg" in clean_msg.lower() and (
+            "not found" in clean_msg.lower() or "missing" in clean_msg.lower()
+        ):
+            return (
+                "FFmpeg 缺失或无法执行。\n"
+                "💡 建议：点击右上方 FFmpeg 状态胶囊，根据指引自动安装或手动配置 FFmpeg。"
+            )
+        elif (
+            "timed out" in clean_msg.lower()
+            or "connection reset" in clean_msg.lower()
+            or "network" in clean_msg.lower()
+        ):
+            return "网络连接超时或中断。\n💡 建议：请检查网络连接或代理设置后重试。"
+
+        # 默认返回提取后的简洁错误信息
+        # 如果包含 ERROR: 前缀，提取主要错误行
+        error_lines = [
+            line.strip() for line in clean_msg.splitlines() if "ERROR:" in line
+        ]
+        if error_lines:
+            return "\n".join(error_lines)
+        return clean_msg[:300] if len(clean_msg) > 300 else clean_msg
 
     def get_base_options(self):
         """获取 yt-dlp 基础配置选项"""
@@ -250,7 +307,8 @@ class YTDlpDownloader:
                     "subtitle_opts": subtitle_opts,
                 }
             except Exception as e:
-                return {"status": "error", "message": str(e)}
+                friendly_msg = self.format_error_message(e)
+                return {"status": "error", "message": friendly_msg}
 
     def download(
         self,
@@ -354,7 +412,7 @@ class YTDlpDownloader:
                 return {"status": "success"}
             except DownloadCancelled:
                 if cleanup_on_cancel:
-                    self._cleanup_partial_files()
+                    self._cleanup_partial_files(base_dir=output_path)
                 elif self.log_callback:
                     self.log_callback(
                         "⏸️ 下载已暂停/取消。保留未完成的 .part 临时文件，支持下次继续下载。"
@@ -364,7 +422,7 @@ class YTDlpDownloader:
                 msg = str(err)
                 if self._cancel_event.is_set():
                     if cleanup_on_cancel:
-                        self._cleanup_partial_files()
+                        self._cleanup_partial_files(base_dir=output_path)
                     elif self.log_callback:
                         self.log_callback(
                             "⏸️ 下载已暂停/取消。保留未完成的 .part 临时文件，支持下次继续下载。"
@@ -372,23 +430,46 @@ class YTDlpDownloader:
                     return {"status": "cancelled", "message": "用户已取消下载"}
                 if "Download cancelled" in msg:
                     if cleanup_on_cancel:
-                        self._cleanup_partial_files()
+                        self._cleanup_partial_files(base_dir=output_path)
                     elif self.log_callback:
                         self.log_callback(
                             "⏸️ 下载已暂停/取消。保留未完成的 .part 临时文件，支持下次继续下载。"
                         )
                     return {"status": "cancelled", "message": "用户已取消下载"}
-                return {"status": "error", "message": msg}
+                friendly_msg = self.format_error_message(err)
+                return {"status": "error", "message": friendly_msg}
 
-    def _cleanup_partial_files(self):
-        """清理下载一半产生的残留文件（如取消且用户选择彻底清理时）"""
-        for f in self._current_filenames:
+    @staticmethod
+    def _is_path_safe(target_path: str, base_dir: str) -> bool:
+        """检查 target_path 是否安全地包含在 base_dir 目录之内，防御路径遍历攻击"""
+        try:
+            target = Path(target_path).resolve()
+            base = Path(base_dir).resolve()
+            target.relative_to(base)
+            return True
+        except (ValueError, Exception):
+            return False
+
+    def _cleanup_partial_files(self, base_dir: str | None = None):
+        """清理下载一半产生的残留文件（如取消且用户选择彻底清理时）
+
+        :param base_dir: 限制清理的文件所在的基础输出目录，进行路径安全约束
+        """
+        for f in list(self._current_filenames):
             for ext in ["", ".part", ".ytdl"]:
                 path = f + ext
                 if path.endswith(".part.part"):
                     continue
 
                 if os.path.exists(path):
+                    # 路径遍历安全防御：若提供了 base_dir，必须确保目标文件在 base_dir 内部
+                    if base_dir and not self._is_path_safe(path, base_dir):
+                        if self.log_callback:
+                            self.log_callback(
+                                f"⚠️ 警告: 跳过非安全目录内的清理项: {path}"
+                            )
+                        continue
+
                     try:
                         os.remove(path)
                         if self.log_callback:
