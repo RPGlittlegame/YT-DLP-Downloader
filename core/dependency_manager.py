@@ -2,16 +2,16 @@ from __future__ import annotations
 
 import contextlib
 import glob
-import importlib
-import importlib.util
 import json
 import os
 import platform
+import shlex
 import shutil
 import stat
 import subprocess
 import sys
 import tarfile
+import tempfile
 import urllib.request
 import zipfile
 from collections.abc import Callable
@@ -19,72 +19,108 @@ from collections.abc import Callable
 
 class DependencyManager:
     """
-    依赖管理器（单例模式）：
-    负责探测、校验系统环境中的 FFmpeg、管理用户自定义路径、本地缓存目录及提供一键下载解压能力。
+    核心依赖管理器（单例模式）：
+    统一管理 yt-dlp 与 FFmpeg 两个外部系统级可执行文件：
+    1. 探测优先级：用户自定义路径 -> 系统环境（macOS 优先 Homebrew /opt/homebrew/bin）-> Full 版内置目录 (bin/)
+    2. 不使用 ~/.ydd/bin 私有缓存，一键安装直接部署到系统默认目录
+    3. ~/.ydd/config.json 仅保存用户手动指定的自定义路径
     """
 
-    # 官方/权威免安装静态二进制包下载镜像源
-    FFMPEG_DOWNLOAD_URLS = {
-        "windows_x64": "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip",
-        "macos_arm64": "https://evermeet.cx/ffmpeg/getrelease/zip",
-        "macos_x86_64": "https://evermeet.cx/ffmpeg/getrelease/zip",
-        "linux_x64": "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz",
+    SUPPORTED_TOOLS = ("yt-dlp", "ffmpeg")
+
+    # 官方静态二进制下载地址
+    DOWNLOAD_URLS: dict[str, dict[str, str]] = {
+        "ffmpeg": {
+            "windows_x64": "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip",
+            "macos_arm64": "https://evermeet.cx/ffmpeg/getrelease/zip",
+            "macos_x86_64": "https://evermeet.cx/ffmpeg/getrelease/zip",
+            "linux_x64": "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz",
+        },
+        "yt-dlp": {
+            "windows_x64": "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe",
+            "macos_arm64": "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos",
+            "macos_x86_64": "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos",
+            "linux_x64": "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux",
+        },
     }
 
     # 各系统终端快速安装命令参考
     INSTALL_COMMANDS = {
-        "darwin": "brew install ffmpeg",
-        "win32": "winget install Gyan.FFmpeg",
-        "linux": "sudo apt update && sudo apt install ffmpeg",
+        "darwin": "brew install yt-dlp ffmpeg",
+        "win32": "winget install yt-dlp.yt-dlp Gyan.FFmpeg",
+        "linux": "sudo apt update && sudo apt install -y ffmpeg yt-dlp",
     }
-
-    def _ensure_dir(self, directory: str) -> None:
-        try:
-            if not os.path.exists(directory):
-                os.makedirs(directory, exist_ok=True)
-        except OSError:
-            pass
 
     def __init__(self):
         self.app_data_dir = self._get_app_data_dir()
-        self.bin_cache_dir = os.path.join(self.app_data_dir, "bin")
         self.config_file = os.path.join(self.app_data_dir, "config.json")
-        self._ensure_dir(self.bin_cache_dir)
-        self._custom_ffmpeg_path = self._load_custom_path()
+        self._custom_paths: dict[str, str | None] = self._load_custom_paths()
 
     @staticmethod
     def _get_app_data_dir() -> str:
-        """获取应用全局配置/缓存目录 ~/.ydd/"""
-        home = os.path.expanduser("~")
-        return os.path.join(home, ".ydd")
+        """获取应用配置目录 ~/.ydd/（仅用于保存 config.json）"""
+        return os.path.join(os.path.expanduser("~"), ".ydd")
 
-    def _load_custom_path(self) -> str | None:
-        """从配置文件中读取用户自定义的 FFmpeg 路径"""
+    @staticmethod
+    def _config_key(tool: str) -> str:
+        return "ytdlp_path" if tool == "yt-dlp" else "ffmpeg_path"
+
+    @staticmethod
+    def _exe_name(tool: str) -> str:
+        return f"{tool}.exe" if sys.platform == "win32" else tool
+
+    def _load_custom_paths(self) -> dict[str, str | None]:
+        """从 ~/.ydd/config.json 读取用户自定义的依赖路径"""
+        result: dict[str, str | None] = {"yt-dlp": None, "ffmpeg": None}
         if not os.path.exists(self.config_file):
-            return None
+            return result
         try:
             with open(self.config_file, encoding="utf-8") as f:
                 data = json.load(f)
-                val = data.get("ffmpeg_path")
-                return str(val) if val else None
+            if isinstance(data, dict):
+                for tool in self.SUPPORTED_TOOLS:
+                    val = data.get(self._config_key(tool))
+                    result[tool] = str(val) if val else None
         except Exception:
-            return None
+            pass
+        return result
 
-    def save_custom_path(self, path: str | None) -> bool:
-        """持久化保存用户自定义的 FFmpeg 路径"""
-        self._custom_ffmpeg_path = path
+    def save_custom_path(
+        self, tool_or_path: str | None, path: str | None = None
+    ) -> bool:
+        """
+        持久化保存用户自定义路径。
+        支持新接口 save_custom_path("yt-dlp", "/path/to/yt-dlp")
+        也兼容旧接口 save_custom_path("/path/to/ffmpeg") / save_custom_path(None)
+        """
+        if tool_or_path in self.SUPPORTED_TOOLS:
+            tool = tool_or_path
+            target_path = path
+        elif tool_or_path is None:
+            tool = "ffmpeg"
+            target_path = None
+        else:
+            tool = "ffmpeg"
+            target_path = tool_or_path
+
+        self._custom_paths[tool] = target_path
         try:
-            data = {}
+            os.makedirs(self.app_data_dir, exist_ok=True)
+            data: dict = {}
             if os.path.exists(self.config_file):
                 try:
                     with open(self.config_file, encoding="utf-8") as f:
-                        data = json.load(f)
+                        loaded = json.load(f)
+                        if isinstance(loaded, dict):
+                            data = loaded
                 except Exception:
                     data = {}
-            if path:
-                data["ffmpeg_path"] = path
+
+            key = self._config_key(tool)
+            if target_path:
+                data[key] = target_path
             else:
-                data.pop("ffmpeg_path", None)
+                data.pop(key, None)
 
             with open(self.config_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
@@ -93,14 +129,13 @@ class DependencyManager:
             return False
 
     @staticmethod
-    def verify_executable(path: str) -> tuple[bool, str]:
+    def verify_executable(path: str, tool: str | None = None) -> tuple[bool, str]:
         """
-        验证指定路径的 FFmpeg 二进制是否可用及可执行，并提取版本简述
+        验证指定路径的 yt-dlp 或 FFmpeg 二进制是否可用，并提取版本简述
         """
-        if not path or not os.path.exists(path):
+        if not path or not os.path.isfile(path):
             return False, "文件不存在"
 
-        # 检查可执行权限
         if sys.platform != "win32":
             try:
                 st = os.stat(path)
@@ -111,225 +146,199 @@ class DependencyManager:
             except OSError:
                 pass
 
+        is_ytdlp = (
+            tool == "yt-dlp"
+            if tool is not None
+            else "yt-dlp" in os.path.basename(path).lower()
+        )
+        ver_flag = "--version" if is_ytdlp else "-version"
+
         try:
-            # 运行 ffmpeg -version 进行真实验证
             res = subprocess.run(
-                [path, "-version"],
+                [path, ver_flag],
                 capture_output=True,
                 text=True,
-                timeout=5,
+                timeout=8,
                 creationflags=subprocess.CREATE_NO_WINDOW
                 if sys.platform == "win32"
                 else 0,
             )
             if res.returncode == 0:
-                first_line = res.stdout.splitlines()[0] if res.stdout else "ffmpeg"
+                out_lines = (res.stdout or "").splitlines()
+                first_line = out_lines[0].strip() if out_lines else (tool or "ok")
                 return True, first_line
             return False, f"返回码异常: {res.returncode}"
         except Exception as e:
             return False, f"执行失败: {e}"
 
     @staticmethod
-    def _find_common_system_ffmpeg() -> str | None:
+    def get_system_install_dir() -> str:
         """
-        全盘深度扫描操作系统常见安装路径、包管理器路径及全局 Python 环境下的 FFmpeg
-        解决 macOS/Linux 打包 GUI 应用未继承终端 PATH 或使用独立虚拟环境无法检测到的痛点
+        获取当前操作系统的默认外部命令安装目录：
+        - macOS: 优先 /opt/homebrew/bin (Homebrew)，其次 /usr/local/bin，回退 ~/.local/bin
+        - Windows: %LOCALAPPDATA%\\Programs\\bin
+        - Linux: /usr/local/bin（若可写），否则 ~/.local/bin
         """
         home = os.path.expanduser("~")
-        candidate_paths: list[str] = []
+        if sys.platform == "darwin":
+            if os.path.isdir("/opt/homebrew/bin") or os.path.isdir("/opt/homebrew"):
+                return "/opt/homebrew/bin"
+            if os.path.isdir("/usr/local/bin"):
+                return "/usr/local/bin"
+            return os.path.join(home, ".local", "bin")
+
+        if sys.platform == "win32":
+            localappdata = os.environ.get(
+                "LOCALAPPDATA", os.path.join(home, "AppData", "Local")
+            )
+            win_bin = os.path.join(localappdata, "Programs", "bin")
+            with contextlib.suppress(OSError):
+                os.makedirs(win_bin, exist_ok=True)
+            return win_bin
+
+        # Linux
+        if os.path.isdir("/usr/local/bin") and os.access("/usr/local/bin", os.W_OK):
+            return "/usr/local/bin"
+        return os.path.join(home, ".local", "bin")
+
+    def _find_system_candidates(self, tool: str) -> list[tuple[str, str]]:
+        """
+        按平台优先级生成系统探测候选列表: [(路径, 来源标签), ...]
+        macOS 优先探测 Homebrew (/opt/homebrew/bin)
+        """
+        exe_name = self._exe_name(tool)
+        home = os.path.expanduser("~")
+        candidates: list[tuple[str, str]] = []
 
         if sys.platform == "darwin":
-            # 1. macOS 常见包管理器与工具链路径
-            candidate_paths.extend([
-                "/opt/homebrew/bin/ffmpeg",
-                "/opt/homebrew/sbin/ffmpeg",
-                "/usr/local/bin/ffmpeg",
-                "/usr/local/sbin/ffmpeg",
-                "/opt/local/bin/ffmpeg",
-                "/opt/local/sbin/ffmpeg",
-                "/Applications/FFmpeg/ffmpeg",
-                "/Applications/ffmpeg",
-                os.path.join(home, "bin", "ffmpeg"),
-                os.path.join(home, ".local", "bin", "ffmpeg"),
-                os.path.join(home, "miniconda3", "bin", "ffmpeg"),
-                os.path.join(home, "anaconda3", "bin", "ffmpeg"),
-                os.path.join(home, "miniforge3", "bin", "ffmpeg"),
-                os.path.join(home, ".pyenv", "shims", "ffmpeg"),
-            ])
-            # 2. 扫描系统全局及主流 Python 环境中的 imageio_ffmpeg 二进制
-            imageio_patterns = [
-                os.path.join(home, ".local", "lib", "python*", "site-packages", "imageio_ffmpeg", "binaries", "ffmpeg*"),
-                os.path.join(home, "Library", "Python", "*", "lib", "python", "site-packages", "imageio_ffmpeg", "binaries", "ffmpeg*"),
-                "/Library/Frameworks/Python.framework/Versions/*/lib/python*/site-packages/imageio_ffmpeg/binaries/ffmpeg*",
-                "/opt/homebrew/lib/python*/site-packages/imageio_ffmpeg/binaries/ffmpeg*",
-                "/usr/local/lib/python*/site-packages/imageio_ffmpeg/binaries/ffmpeg*",
-                os.path.join(home, "miniconda3", "lib", "python*", "site-packages", "imageio_ffmpeg", "binaries", "ffmpeg*"),
-                os.path.join(home, "anaconda3", "lib", "python*", "site-packages", "imageio_ffmpeg", "binaries", "ffmpeg*"),
-                os.path.join(home, "miniforge3", "lib", "python*", "site-packages", "imageio_ffmpeg", "binaries", "ffmpeg*"),
+            # 1. macOS 绝对优先 Homebrew 目录
+            candidates.append(
+                (f"/opt/homebrew/bin/{exe_name}", "Homebrew (/opt/homebrew/bin)")
+            )
+            # 2. 常见系统目录 /usr/local/bin
+            candidates.append((f"/usr/local/bin/{exe_name}", "系统 (/usr/local/bin)"))
+            # 3. 环境变量 PATH
+            which_path = shutil.which(tool) or shutil.which(exe_name)
+            if which_path:
+                candidates.append((which_path, "系统 PATH"))
+            # 4. 其他标准系统二进制目录
+            extra_paths = [
+                f"/opt/local/bin/{exe_name}",
+                os.path.join(home, ".local", "bin", exe_name),
+                os.path.join(home, "bin", exe_name),
             ]
-            for pat in imageio_patterns:
-                for f in glob.glob(pat):
-                    if not f.endswith((".py", ".pyc", ".md")) and os.path.isfile(f):
-                        candidate_paths.append(f)
+            extra_paths.extend(
+                glob.glob(f"/Library/Frameworks/Python.framework/Versions/*/bin/{exe_name}")
+            )
+            for p in extra_paths:
+                candidates.append((p, "系统目录"))
 
         elif sys.platform == "win32":
-            localappdata = os.environ.get("LOCALAPPDATA", os.path.join(home, "AppData", "Local"))
-            appdata = os.environ.get("APPDATA", os.path.join(home, "AppData", "Roaming"))
+            # 1. 系统 PATH
+            which_path = shutil.which(tool) or shutil.which(exe_name)
+            if which_path:
+                candidates.append((which_path, "系统 PATH"))
+
+            # 2. Windows 常见系统与包管理器目录
+            localappdata = os.environ.get(
+                "LOCALAPPDATA", os.path.join(home, "AppData", "Local")
+            )
             progdata = os.environ.get("PROGRAMDATA", r"C:\ProgramData")
             progfiles = os.environ.get("PROGRAMFILES", r"C:\Program Files")
-            progfiles86 = os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")
 
-            candidate_paths.extend([
-                os.path.join(progdata, "chocolatey", "bin", "ffmpeg.exe"),
-                os.path.join(home, "scoop", "shims", "ffmpeg.exe"),
-                os.path.join(home, "scoop", "apps", "ffmpeg", "current", "bin", "ffmpeg.exe"),
-                os.path.join(localappdata, "Programs", "ffmpeg", "bin", "ffmpeg.exe"),
-                os.path.join(home, "miniconda3", "Library", "bin", "ffmpeg.exe"),
-                os.path.join(home, "anaconda3", "Library", "bin", "ffmpeg.exe"),
-                r"C:\ffmpeg\bin\ffmpeg.exe",
-                r"C:\tools\ffmpeg\bin\ffmpeg.exe",
-                os.path.join(progfiles, "ffmpeg", "bin", "ffmpeg.exe"),
-                os.path.join(progfiles86, "ffmpeg", "bin", "ffmpeg.exe"),
-            ])
-            # WinGet Packages 搜索
-            winget_pattern = os.path.join(localappdata, "Microsoft", "WinGet", "Packages", "*", "ffmpeg.exe")
-            candidate_paths.extend(glob.glob(winget_pattern))
-
-            # Windows Python imageio_ffmpeg 搜索
-            imageio_patterns_win = [
-                os.path.join(localappdata, "Programs", "Python", "Python*", "Lib", "site-packages", "imageio_ffmpeg", "binaries", "ffmpeg*.exe"),
-                os.path.join(appdata, "Python", "Python*", "site-packages", "imageio_ffmpeg", "binaries", "ffmpeg*.exe"),
-                r"C:\Python*\Lib\site-packages\imageio_ffmpeg\binaries\ffmpeg*.exe",
+            extra_win = [
+                os.path.join(localappdata, "Programs", "bin", exe_name),
+                os.path.join(localappdata, "Microsoft", "WinGet", "Links", exe_name),
+                os.path.join(home, "scoop", "shims", exe_name),
+                os.path.join(progdata, "chocolatey", "bin", exe_name),
+                os.path.join(localappdata, "Programs", tool, "bin", exe_name),
+                os.path.join(localappdata, "Programs", tool, exe_name),
+                os.path.join(progfiles, tool, "bin", exe_name),
+                rf"C:\ffmpeg\bin\{exe_name}",
             ]
-            for pat in imageio_patterns_win:
-                candidate_paths.extend(glob.glob(pat))
+            extra_win.extend(
+                glob.glob(
+                    os.path.join(
+                        localappdata, "Microsoft", "WinGet", "Packages", "*", exe_name
+                    )
+                )
+            )
+            for p in extra_win:
+                candidates.append((p, "系统目录"))
 
         else:
-            # Linux 环境
-            candidate_paths.extend([
-                "/usr/bin/ffmpeg",
-                "/usr/local/bin/ffmpeg",
-                "/snap/bin/ffmpeg",
-                "/var/lib/flatpak/exports/bin/ffmpeg",
-                os.path.join(home, "bin", "ffmpeg"),
-                os.path.join(home, ".local", "bin", "ffmpeg"),
-                os.path.join(home, "miniconda3", "bin", "ffmpeg"),
-                os.path.join(home, "anaconda3", "bin", "ffmpeg"),
-            ])
-            imageio_patterns_linux = [
-                os.path.join(home, ".local", "lib", "python*", "site-packages", "imageio_ffmpeg", "binaries", "ffmpeg*"),
-                "/usr/local/lib/python*/dist-packages/imageio_ffmpeg/binaries/ffmpeg*",
-                "/usr/lib/python*/dist-packages/imageio_ffmpeg/binaries/ffmpeg*",
+            # Linux
+            which_path = shutil.which(tool) or shutil.which(exe_name)
+            if which_path:
+                candidates.append((which_path, "系统 PATH"))
+            extra_linux = [
+                f"/usr/local/bin/{exe_name}",
+                f"/usr/bin/{exe_name}",
+                os.path.join(home, ".local", "bin", exe_name),
+                os.path.join(home, "bin", exe_name),
+                f"/snap/bin/{exe_name}",
             ]
-            for pat in imageio_patterns_linux:
-                for f in glob.glob(pat):
-                    if not f.endswith((".py", ".pyc", ".md")) and os.path.isfile(f):
-                        candidate_paths.append(f)
+            for p in extra_linux:
+                candidates.append((p, "系统目录"))
 
-        # 检查候选路径并去重验证
-        seen = set()
-        for cand in candidate_paths:
-            norm_cand = os.path.normpath(cand)
-            if norm_cand not in seen and os.path.exists(norm_cand) and os.path.isfile(norm_cand):
-                seen.add(norm_cand)
-                valid, _ = DependencyManager.verify_executable(norm_cand)
-                if valid:
-                    return norm_cand
-        return None
+        return candidates
 
-    def detect_ffmpeg(self) -> dict[str, str | None]:
+    def detect_tool(self, tool: str) -> dict[str, str | None]:
         """
-        多级探测 FFmpeg 依赖可用性：
-        1. 用户自定义配置 (Custom)
-        2. 系统 PATH 环境 (System PATH)
-        3. 打包内置 / 本地应用 bin/ 目录 (Bundled bin)
-        4. 当前 Python 环境静态库 imageio_ffmpeg
-        5. 全局系统标准路径与主流包管理器/Python安装 (Homebrew / Winget / Conda / imageio)
-        6. 应用本地数据缓存目录 (~/.ydd/bin/ffmpeg)
+        三级探测指定依赖 (yt-dlp 或 ffmpeg)：
+        1. 用户手动指定路径 (~/.ydd/config.json)
+        2. 系统环境探测（macOS 优先 /opt/homebrew/bin，再查 /usr/local/bin、PATH 与常见系统目录）
+        3. Full 版打包内置目录 (bin/)
         """
-        ffmpeg_name = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
+        if tool not in self.SUPPORTED_TOOLS:
+            raise ValueError(f"Unsupported tool: {tool}")
 
-        # 1. 检查用户配置
-        if self._custom_ffmpeg_path:
-            valid, info = self.verify_executable(self._custom_ffmpeg_path)
+        exe_name = self._exe_name(tool)
+
+        # 第 1 级：用户手动自定义路径
+        custom_path = self._custom_paths.get(tool)
+        if custom_path:
+            valid, info = self.verify_executable(custom_path, tool)
             if valid:
                 return {
-                    "path": self._custom_ffmpeg_path,
+                    "path": custom_path,
                     "source": "自定义路径",
                     "status": "ok",
                     "info": info,
                 }
 
-        # 2. 检查系统全局 PATH 环境变量 (系统优先，零冗余)
-        system_ffmpeg = shutil.which("ffmpeg")
-        if system_ffmpeg:
-            valid, info = self.verify_executable(system_ffmpeg)
-            if valid:
-                return {
-                    "path": system_ffmpeg,
-                    "source": "系统 PATH",
-                    "status": "ok",
-                    "info": info,
-                }
+        # 第 2 级：系统环境探测
+        seen: set[str] = set()
+        for cand_path, source_label in self._find_system_candidates(tool):
+            norm_path = os.path.normpath(cand_path)
+            if norm_path in seen:
+                continue
+            seen.add(norm_path)
+            if os.path.isfile(norm_path):
+                valid, info = self.verify_executable(norm_path, tool)
+                if valid:
+                    return {
+                        "path": norm_path,
+                        "source": source_label,
+                        "status": "ok",
+                        "info": info,
+                    }
 
-        # 3. 检查打包内置 / bin/ 目录
+        # 第 3 级：Full 版打包内置 bin/ 目录
         if getattr(sys, "frozen", False):
             base_dir = getattr(
                 sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))
             )
         else:
             base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        bundle_bin = os.path.join(base_dir, "bin", ffmpeg_name)
-        if os.path.exists(bundle_bin):
-            valid, info = self.verify_executable(bundle_bin)
+
+        bundle_bin = os.path.join(base_dir, "bin", exe_name)
+        if os.path.isfile(bundle_bin):
+            valid, info = self.verify_executable(bundle_bin, tool)
             if valid:
                 return {
                     "path": bundle_bin,
-                    "source": "内置引擎 (bin)",
-                    "status": "ok",
-                    "info": info,
-                }
-
-        # 4. 检查当前 Python 环境静态库 imageio_ffmpeg
-        if importlib.util.find_spec("imageio_ffmpeg") is not None:
-            try:
-                imageio_ffmpeg_mod = importlib.import_module("imageio_ffmpeg")
-                get_exe = getattr(imageio_ffmpeg_mod, "get_ffmpeg_exe", None)
-                if callable(get_exe):
-                    img_ffmpeg = get_exe()
-                    if isinstance(img_ffmpeg, str) and os.path.exists(img_ffmpeg):
-                        valid, info = self.verify_executable(img_ffmpeg)
-                        if valid:
-                            return {
-                                "path": img_ffmpeg,
-                                "source": "静态引擎 (imageio)",
-                                "status": "ok",
-                                "info": info,
-                            }
-            except Exception:
-                pass
-
-        # 5. 深度扫描系统与全盘常见路径 (Homebrew / Conda / Winget / 全局 imageio-ffmpeg)
-        deep_found = self._find_common_system_ffmpeg()
-        if deep_found:
-            valid, info = self.verify_executable(deep_found)
-            if valid:
-                source_label = "系统安装 (Homebrew/系统工具)" if "homebrew" in deep_found.lower() else "本地发现 (全盘探测)"
-                return {
-                    "path": deep_found,
-                    "source": source_label,
-                    "status": "ok",
-                    "info": info,
-                }
-
-        # 6. 检查应用本地缓存目录 ~/.ydd/bin/
-        cached_bin = os.path.join(self.bin_cache_dir, ffmpeg_name)
-        if os.path.exists(cached_bin):
-            valid, info = self.verify_executable(cached_bin)
-            if valid:
-                return {
-                    "path": cached_bin,
-                    "source": "本地缓存 (一键安装)",
+                    "source": "内置引擎 (Full)",
                     "status": "ok",
                     "info": info,
                 }
@@ -338,66 +347,133 @@ class DependencyManager:
             "path": None,
             "source": "未检测到",
             "status": "missing",
-            "info": "未找到可用的 FFmpeg",
+            "info": f"未找到可用的 {tool}",
+        }
+
+    def detect_ffmpeg(self) -> dict[str, str | None]:
+        """探测系统 FFmpeg 依赖"""
+        return self.detect_tool("ffmpeg")
+
+    def detect_ytdlp(self) -> dict[str, str | None]:
+        """探测系统 yt-dlp 依赖"""
+        return self.detect_tool("yt-dlp")
+
+    def detect_all(self) -> dict[str, dict[str, str | None]]:
+        """同时探测 yt-dlp 与 FFmpeg"""
+        return {
+            "yt-dlp": self.detect_ytdlp(),
+            "ffmpeg": self.detect_ffmpeg(),
         }
 
     def get_quick_install_command(self) -> str:
-        """获取当前系统适用的快速包管理安装命令"""
+        """获取当前系统适用的包管理器安装命令"""
         if sys.platform == "darwin":
             return self.INSTALL_COMMANDS["darwin"]
-        elif sys.platform == "win32":
+        if sys.platform == "win32":
             return self.INSTALL_COMMANDS["win32"]
         return self.INSTALL_COMMANDS["linux"]
 
-    def get_download_url(self) -> str | None:
+    def get_download_url(self, tool: str = "ffmpeg") -> str | None:
         """获取适合当前平台架构的官方静态二进制下载地址"""
+        tool_urls = self.DOWNLOAD_URLS.get(tool)
+        if not tool_urls:
+            return None
+
         system = sys.platform
         arch = platform.machine().lower()
 
         if system == "win32":
-            return self.FFMPEG_DOWNLOAD_URLS["windows_x64"]
-        elif system == "darwin":
+            return tool_urls["windows_x64"]
+        if system == "darwin":
             if "arm" in arch or "aarch64" in arch:
-                return self.FFMPEG_DOWNLOAD_URLS["macos_arm64"]
-            return self.FFMPEG_DOWNLOAD_URLS["macos_x86_64"]
-        elif system.startswith("linux"):
-            return self.FFMPEG_DOWNLOAD_URLS["linux_x64"]
+                return tool_urls["macos_arm64"]
+            return tool_urls["macos_x86_64"]
+        if system.startswith("linux"):
+            return tool_urls["linux_x64"]
         return None
 
-    def download_and_install_ffmpeg(
+    def _install_to_system_dir(
+        self, staged_bin_path: str, target_dir: str, target_path: str
+    ) -> tuple[bool, str]:
+        """
+        将临时目录中的可执行文件安装到系统默认目录。
+        若目标目录需要管理员权限（如 macOS /usr/local/bin），通过系统授权弹窗提权写入。
+        """
+        try:
+            os.makedirs(target_dir, exist_ok=True)
+            if os.path.islink(target_path):
+                os.unlink(target_path)
+            shutil.copy2(staged_bin_path, target_path)
+            if sys.platform != "win32":
+                os.chmod(target_path, 0o755)
+            return True, target_path
+        except PermissionError as err:
+            if sys.platform == "darwin":
+                shell_cmd = (
+                    f"mkdir -p {shlex.quote(target_dir)} && "
+                    f"rm -f {shlex.quote(target_path)} && "
+                    f"cp -f {shlex.quote(staged_bin_path)} {shlex.quote(target_path)} && "
+                    f"chmod 755 {shlex.quote(target_path)}"
+                )
+                apple_escaped = shell_cmd.replace("\\", "\\\\").replace('"', '\\"')
+                res = subprocess.run(
+                    [
+                        "osascript",
+                        "-e",
+                        f'do shell script "{apple_escaped}" with administrator privileges',
+                    ],
+                    capture_output=True,
+                    text=True,
+                )
+                if res.returncode == 0:
+                    return True, target_path
+                err_msg = (res.stderr or "").strip() or str(err)
+                return False, f"写入系统目录 {target_dir} 被拒绝或取消授权: {err_msg}"
+            return False, f"没有权限写入系统目录 {target_dir}: {err}"
+        except Exception as e:
+            return False, f"安装到系统目录失败: {e}"
+
+    def download_and_install(
         self,
+        tool: str,
         progress_callback: Callable[[float, str], None] | None = None,
         cancel_event=None,
     ) -> tuple[bool, str]:
         """
-        异步流式下载静态 FFmpeg 并解压配置到 ~/.ydd/bin/
+        异步流式下载指定工具官方二进制并部署到系统默认目录（macOS 优先 /opt/homebrew/bin）
+        :param tool: "yt-dlp" 或 "ffmpeg"
         :param progress_callback: (0.0~1.0, 状态文本)
         :param cancel_event: 外部 threading.Event 控制取消
         """
-        url = self.get_download_url()
+        if tool not in self.SUPPORTED_TOOLS:
+            return False, f"不支持的工具类型: {tool}"
+
+        url = self.get_download_url(tool)
         if not url:
             return (
                 False,
                 f"暂不支持当前系统架构 ({sys.platform}-{platform.machine()}) 的自动下载",
             )
 
-        ffmpeg_name = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
-        target_path = os.path.join(self.bin_cache_dir, ffmpeg_name)
-        archive_name = "ffmpeg_download.tmp"
-        temp_archive_path = os.path.join(self.app_data_dir, archive_name)
+        exe_name = self._exe_name(tool)
+        target_dir = self.get_system_install_dir()
+        target_path = os.path.join(target_dir, exe_name)
+
+        temp_dir = tempfile.mkdtemp(prefix=f"ydd_{tool}_")
+        temp_download_path = os.path.join(temp_dir, "download.tmp")
+        staged_bin_path = os.path.join(temp_dir, exe_name)
 
         try:
             if progress_callback:
-                progress_callback(0.05, "正在连接下载节点...")
+                progress_callback(0.05, f"正在连接 {tool} 官方下载节点...")
 
-            # 1. 下载文件
             req = urllib.request.Request(
                 url,
                 headers={"User-Agent": "Mozilla/5.0 (YT-DLP-Downloader-Installer)"},
             )
             with (
                 urllib.request.urlopen(req, timeout=30) as response,
-                open(temp_archive_path, "wb") as out_file,
+                open(temp_download_path, "wb") as out_file,
             ):
                 total_length = response.headers.get("content-length")
                 total_size = int(total_length) if total_length else None
@@ -413,78 +489,94 @@ class DependencyManager:
                     downloaded += len(buffer)
                     out_file.write(buffer)
 
-                    if progress_callback and total_size:
-                        pct = 0.05 + 0.75 * (downloaded / total_size)
+                    if progress_callback:
                         mb = downloaded / (1024 * 1024)
-                        total_mb = total_size / (1024 * 1024)
-                        progress_callback(
-                            pct, f"正在下载引擎包 ({mb:.1f}/{total_mb:.1f} MB)..."
-                        )
+                        if total_size:
+                            pct = 0.05 + 0.75 * (downloaded / total_size)
+                            total_mb = total_size / (1024 * 1024)
+                            progress_callback(
+                                pct,
+                                f"正在下载 {tool} ({mb:.1f}/{total_mb:.1f} MB)...",
+                            )
+                        else:
+                            progress_callback(0.4, f"正在下载 {tool} ({mb:.1f} MB)...")
 
             if progress_callback:
-                progress_callback(0.85, "下载完成，正在解压与校验...")
+                progress_callback(0.85, f"下载完成，正在解压并部署到 {target_dir}...")
 
-            # 2. 解压提取 ffmpeg
             extracted = False
-            # 尝试作为 zip 解压
-            if zipfile.is_zipfile(temp_archive_path):
-                with zipfile.ZipFile(temp_archive_path, "r") as zip_ref:
+            expected_names = {exe_name.lower(), tool.lower()}
+            if zipfile.is_zipfile(temp_download_path):
+                with zipfile.ZipFile(temp_download_path, "r") as zip_ref:
                     for member in zip_ref.namelist():
-                        basename = os.path.basename(member)
-                        if basename.lower() in ["ffmpeg.exe", "ffmpeg"]:
+                        basename = os.path.basename(member).lower()
+                        if basename in expected_names:
                             with (
                                 zip_ref.open(member) as source,
-                                open(target_path, "wb") as target,
+                                open(staged_bin_path, "wb") as target,
                             ):
                                 shutil.copyfileobj(source, target)
                             extracted = True
                             break
-            # 尝试作为 tar 解压
-            elif tarfile.is_tarfile(temp_archive_path):
-                with tarfile.open(temp_archive_path, "r:*") as tar_ref:
+            elif tarfile.is_tarfile(temp_download_path):
+                with tarfile.open(temp_download_path, "r:*") as tar_ref:
                     for member in tar_ref.getmembers():
-                        basename = os.path.basename(member.name)
-                        if basename.lower() in ["ffmpeg.exe", "ffmpeg"]:
+                        basename = os.path.basename(member.name).lower()
+                        if basename in expected_names:
                             f = tar_ref.extractfile(member)
                             if f:
-                                with open(target_path, "wb") as target:
+                                with open(staged_bin_path, "wb") as target:
                                     shutil.copyfileobj(f, target)
                                 extracted = True
                                 break
             else:
-                # 可能是直接的二进制流文件
-                shutil.copy(temp_archive_path, target_path)
+                shutil.copy2(temp_download_path, staged_bin_path)
                 extracted = True
 
-            # 清理临时下载文件
-            if os.path.exists(temp_archive_path):
-                with contextlib.suppress(Exception):
-                    os.remove(temp_archive_path)
+            if not extracted or not os.path.isfile(staged_bin_path):
+                return False, f"未能从下载文件中提取到 {exe_name}"
 
-            if not extracted or not os.path.exists(target_path):
-                return False, "未能从下载归档中提取到 ffmpeg 二进制文件"
-
-            # 3. 赋予可执行权限并进行校验
             if sys.platform != "win32":
-                st = os.stat(target_path)
-                os.chmod(
-                    target_path, st.st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
-                )
+                os.chmod(staged_bin_path, 0o755)
 
-            valid, info = self.verify_executable(target_path)
-            if not valid:
-                return False, f"安装后的 FFmpeg 校验失败: {info}"
+            installed, install_msg = self._install_to_system_dir(
+                staged_bin_path, target_dir, target_path
+            )
+            if not installed:
+                return False, install_msg
 
             if progress_callback:
-                progress_callback(1.0, "FFmpeg 引擎已成功配置就绪！")
+                progress_callback(0.95, f"正在校验系统 {tool}...")
+
+            valid, info = self.verify_executable(target_path, tool)
+            if not valid:
+                return False, f"安装后的 {tool} 校验失败: {info}"
+
+            # 若先前有旧的自定义路径指向别处，则清理它，使系统默认目录优先生效
+            if self._custom_paths.get(tool) and self._custom_paths[tool] != target_path:
+                self.save_custom_path(tool, None)
+
+            if progress_callback:
+                progress_callback(1.0, f"{tool} 已部署到 {target_path}")
 
             return True, target_path
 
         except Exception as e:
-            if os.path.exists(temp_archive_path):
-                with contextlib.suppress(Exception):
-                    os.remove(temp_archive_path)
             return False, f"安装失败: {e}"
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def download_and_install_ffmpeg(
+        self,
+        progress_callback: Callable[[float, str], None] | None = None,
+        cancel_event=None,
+    ) -> tuple[bool, str]:
+        """兼容旧接口：一键下载并安装 FFmpeg 到系统默认目录"""
+        return self.download_and_install(
+            "ffmpeg",
+            progress_callback=progress_callback,
+            cancel_event=cancel_event,
+        )
 
 
 # 全局单例

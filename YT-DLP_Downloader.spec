@@ -8,16 +8,19 @@ datas = [
     ('YDD.icon/Assets/square.and.arrow.down.fill.png', 'YDD.icon/Assets/'),
 ]
 
-# 仅在 full 版本且本地存在 bin/ffmpeg.exe 时内置打包
-if edition == 'full' and os.path.exists('bin/ffmpeg.exe'):
-    datas.append(('bin/ffmpeg.exe', 'bin/'))
+# 仅在 full 版本且本地存在 bin/ffmpeg.exe / bin/yt-dlp.exe 时内置打包
+if edition == 'full':
+    if os.path.exists('bin/ffmpeg.exe'):
+        datas.append(('bin/ffmpeg.exe', 'bin/'))
+    if os.path.exists('bin/yt-dlp.exe'):
+        datas.append(('bin/yt-dlp.exe', 'bin/'))
 
 a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
     datas=datas,
-    hiddenimports=['PIL', 'PIL.Image', 'customtkinter', 'yt_dlp'],
+    hiddenimports=['PIL', 'PIL.Image', 'customtkinter'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

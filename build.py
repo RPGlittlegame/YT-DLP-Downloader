@@ -2,8 +2,8 @@
 """
 YT-DLP Downloader 双轨自动构建脚本
 支持构建:
-  --edition slim (精简版: 不打包 FFmpeg, 依赖系统环境或首次启动按需下载, ~15MB)
-  --edition full (完整版: 内置当前平台的静态 FFmpeg 二进制, 100% 离线开箱即用, ~50MB)
+  --edition slim (精简版: 不打包 FFmpeg 与 yt-dlp, 依赖系统环境或引导安装到系统目录)
+  --edition full (完整版: 内置当前平台的静态 FFmpeg 与 yt-dlp 二进制, 100% 离线开箱即用)
 """
 
 from __future__ import annotations
@@ -69,28 +69,44 @@ def prepare_environment(edition: str) -> dict:
     print(f"[*] 目标构建版本: {edition.upper()}")
 
     if edition == "full":
-        # 检查或准备本地 bin/ 目录下的 ffmpeg
+        # 检查或准备本地 bin/ 目录下的 ffmpeg 与 yt-dlp
         bin_dir = os.path.join(os.path.dirname(__file__), "bin")
-        exe_name = "ffmpeg.exe" if system == "Windows" else "ffmpeg"
-        local_ffmpeg = os.path.join(bin_dir, exe_name)
+        tools = ["ffmpeg", "yt-dlp"]
+        for tool in tools:
+            exe_name = f"{tool}.exe" if system == "Windows" else tool
+            local_bin = os.path.join(bin_dir, exe_name)
 
-        if not os.path.exists(local_ffmpeg):
-            print(f"[!] 警告: Full 版本需要内置静态 FFmpeg 二进制 ({local_ffmpeg})")
-            # 尝试从系统拷贝一份或提示
-            sys_ffmpeg = shutil.which("ffmpeg")
-            if sys_ffmpeg:
-                print(f"[*] 从系统环境拷贝可用 FFmpeg: {sys_ffmpeg} -> {local_ffmpeg}")
-                safe_makedirs(bin_dir)
-                shutil.copy2(sys_ffmpeg, local_ffmpeg)
-                if system != "Windows":
-                    os.chmod(local_ffmpeg, 0o755)
+            if not os.path.exists(local_bin):
+                print(f"[!] 警告: Full 版本需要内置 {tool} 二进制 ({local_bin})")
+                sys_bin = None
+                if system == "Darwin":
+                    for cand in (
+                        f"/opt/homebrew/bin/{exe_name}",
+                        f"/usr/local/bin/{exe_name}",
+                    ):
+                        if os.path.isfile(cand):
+                            sys_bin = cand
+                            break
+                if not sys_bin:
+                    sys_bin = shutil.which(tool)
+                if sys_bin:
+                    print(f"[*] 从系统环境拷贝可用 {tool}: {sys_bin} -> {local_bin}")
+                    safe_makedirs(bin_dir)
+                    shutil.copy2(sys_bin, local_bin)
+                    if system != "Windows":
+                        os.chmod(local_bin, 0o755)
+                        with open(local_bin, "rb") as bf:
+                            if bf.read(2) == b"#!":
+                                print(
+                                    f"[!] 提示: 拷贝的 {tool} 是依赖本地解释器的脚本文件；若需跨机器离线分发 Full 版，建议替换为官方独立静态二进制 (如 yt-dlp_macos)。"
+                                )
+                else:
+                    print(
+                        f"[!] 错误: 未能在本地 bin/ 或系统环境中找到 {exe_name}，请先放置静态二进制或安装 {tool}。"
+                    )
+                    sys.exit(1)
             else:
-                print(
-                    f"[!] 错误: 未能在本地 bin/ 或系统环境中找到 {exe_name}，请先放置静态二进制或安装 ffmpeg。"
-                )
-                sys.exit(1)
-        else:
-            print(f"[*] 检测到内置 FFmpeg 文件: {local_ffmpeg}")
+                print(f"[*] 检测到内置 {tool} 文件: {local_bin}")
 
     return env
 

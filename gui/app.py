@@ -4,13 +4,16 @@ import os
 import shutil
 import sys
 import threading
+import tkinter.messagebox
 from tkinter import filedialog
 from typing import Any
 
 import customtkinter as ctk
 from PIL import Image, ImageTk
 
+from core.dependency_manager import dependency_manager
 from core.downloader import YTDlpDownloader
+from gui.components.dependency_dialog import DependencyDialog
 
 # 设置主题跟随系统
 ctk.set_appearance_mode("System")
@@ -18,13 +21,24 @@ ctk.set_default_color_theme("blue")
 
 
 class App(ctk.CTk):
-    def __init__(self, ffmpeg_location=None, ffmpeg_type="未检测到"):
+    def __init__(
+        self,
+        ffmpeg_location=None,
+        ffmpeg_type="未检测到",
+        ytdlp_location=None,
+        ytdlp_type="未检测到",
+    ):
         super().__init__()
 
         self.ffmpeg_location = ffmpeg_location
         self.ffmpeg_type = ffmpeg_type
+        self.ytdlp_location = ytdlp_location
+        self.ytdlp_type = ytdlp_type
+        self._dep_dialog: DependencyDialog | None = None
+
         self.downloader = YTDlpDownloader(
             ffmpeg_location=self.ffmpeg_location,
+            ytdlp_location=self.ytdlp_location,
             log_callback=self.update_log,
             progress_callback=self.update_progress,
             playlist_item_callback=self.update_item_progress,
@@ -90,6 +104,9 @@ class App(ctk.CTk):
 
         # 初始化 cookie 列表
         self.update_cookie_list()
+
+        # 启动后检查核心依赖并给出软件级提示
+        self.after(400, self._check_dependencies_on_startup)
 
     # ── 图标设置 ────────────────────────────────────────────────────────────
     def _set_app_icon(self):
@@ -187,28 +204,17 @@ class App(ctk.CTk):
         )
         self.title_label.grid(row=0, column=0, sticky="w")
 
-        # FFmpeg 状态徽章
-        ffmpeg_is_ok = (
-            self.ffmpeg_location is not None and self.ffmpeg_type != "未检测到"
-        )
-        badge_text = f"⚙️ FFmpeg: {self.ffmpeg_type}"
-        badge_fg = ("#D4EDDA", "#1E3A2F") if ffmpeg_is_ok else ("#F8D7DA", "#3E2723")
-        badge_text_color = (
-            ("#155724", "#4CAF50") if ffmpeg_is_ok else ("#721C24", "#EF5350")
-        )
-
+        # 综合核心依赖状态徽章 (yt-dlp & FFmpeg)
         self.ffmpeg_badge = ctk.CTkButton(
             self.title_row,
-            text=badge_text,
-            fg_color=badge_fg,
-            text_color=badge_text_color,
-            hover_color=badge_fg,
+            text="",
             corner_radius=6,
             font=ctk.CTkFont(size=11),
             height=24,
             command=self.open_dependency_settings,
         )
         self.ffmpeg_badge.grid(row=0, column=1, sticky="e")
+        self._refresh_dependency_badge()
 
         # --- 选项设置区 ---
         self.options_frame = ctk.CTkFrame(self, corner_radius=10)
@@ -787,6 +793,16 @@ class App(ctk.CTk):
         if self._is_fetching or self._is_closing:
             return
 
+        if not self.ytdlp_location or not os.path.isfile(self.ytdlp_location):
+            tkinter.messagebox.showwarning(
+                "缺少核心依赖",
+                "未检测到 yt-dlp 解析引擎，无法解析视频链接。\n\n"
+                "即将打开【核心依赖配置】，请一键安装到系统默认目录或手动指定路径。",
+                parent=self,
+            )
+            self.open_dependency_settings()
+            return
+
         url = self.url_entry.get().strip()
         if not url:
             self.update_log("错误: 请输入有效的 URL。")
@@ -917,31 +933,34 @@ class App(ctk.CTk):
 
         threading.Thread(target=fetch_task, daemon=True).start()
 
-    def open_dependency_settings(self):
-        """打开依赖设置/引导弹窗"""
-        if self.ffmpeg_location and self.ffmpeg_type != "未检测到":
-            self.update_log(
-                f"ℹ️ 当前 FFmpeg 就绪状态: {self.ffmpeg_type} (路径: {self.ffmpeg_location})"
-            )
+    def _get_missing_dependencies(self) -> list[str]:
+        missing: list[str] = []
+        if (
+            not self.ytdlp_location
+            or not os.path.isfile(self.ytdlp_location)
+            or self.ytdlp_type == "未检测到"
+        ):
+            missing.append("yt-dlp")
+        if (
+            not self.ffmpeg_location
+            or not os.path.isfile(self.ffmpeg_location)
+            or self.ffmpeg_type == "未检测到"
+        ):
+            missing.append("FFmpeg")
+        return missing
+
+    def _refresh_dependency_badge(self):
+        missing = self._get_missing_dependencies()
+        all_ok = len(missing) == 0
+
+        if all_ok:
+            badge_text = "✅ 依赖就绪 (yt-dlp & FFmpeg)"
+            badge_fg = ("#D4EDDA", "#1E3A2F")
+            badge_text_color = ("#155724", "#4CAF50")
         else:
-            self.update_log(
-                "⚠️ 未检测到 FFmpeg 引擎，请执行 pip install imageio-ffmpeg 或安装系统 FFmpeg。"
-            )
-
-    def on_dependency_updated(self, path, source):
-        """当依赖发生更新时刷新界面状态与下载器配置"""
-        self.ffmpeg_location = path
-        self.ffmpeg_type = source
-        self.downloader.ffmpeg_location = path
-
-        ffmpeg_is_ok = (
-            self.ffmpeg_location is not None and self.ffmpeg_type != "未检测到"
-        )
-        badge_text = f"⚙️ FFmpeg: {self.ffmpeg_type}"
-        badge_fg = ("#D4EDDA", "#1E3A2F") if ffmpeg_is_ok else ("#F8D7DA", "#3E2723")
-        badge_text_color = (
-            ("#155724", "#4CAF50") if ffmpeg_is_ok else ("#721C24", "#EF5350")
-        )
+            badge_text = f"⚠️ 缺少依赖: {' & '.join(missing)} (点击配置)"
+            badge_fg = ("#F8D7DA", "#3E2723")
+            badge_text_color = ("#721C24", "#EF5350")
 
         self.ffmpeg_badge.configure(
             text=badge_text,
@@ -949,19 +968,94 @@ class App(ctk.CTk):
             text_color=badge_text_color,
             hover_color=badge_fg,
         )
-        if ffmpeg_is_ok:
-            self.update_log(f"✅ FFmpeg 依赖已就绪: {self.ffmpeg_type} -> {path}")
+
+    def _check_dependencies_on_startup(self):
+        """启动时检测核心依赖；若缺失则打印提示并自动弹出配置引导"""
+        if self._is_closing:
+            return
+        missing = self._get_missing_dependencies()
+        if missing:
+            self.update_log(
+                f"⚠️ 启动检测：系统缺少核心依赖 ({'、'.join(missing)})，已打开依赖配置弹窗引导安装到系统目录。"
+            )
+            self.open_dependency_settings()
         else:
-            self.update_log("⚠️ 当前未检测到可用 FFmpeg 引擎。")
+            self.update_log(
+                f"✅ 系统依赖就绪：yt-dlp [{self.ytdlp_type}] | FFmpeg [{self.ffmpeg_type}]"
+            )
+
+    def open_dependency_settings(self):
+        """打开核心依赖配置与系统安装引导弹窗"""
+        if self._dep_dialog is not None and self._dep_dialog.winfo_exists():
+            self._dep_dialog.lift()
+            self._dep_dialog.focus_force()
+            return
+
+        self._dep_dialog = DependencyDialog(
+            self, on_dependency_updated=self.on_dependency_updated
+        )
+
+    def on_dependency_updated(self, states: dict[str, dict] | None = None):
+        """当依赖发生更新时刷新界面状态与下载器配置"""
+        if states is None:
+            states = dependency_manager.detect_all()
+
+        ytdlp_info = states.get("yt-dlp", {})
+        ffmpeg_info = states.get("ffmpeg", {})
+
+        self.ytdlp_location = ytdlp_info.get("path")
+        self.ytdlp_type = str(ytdlp_info.get("source") or "未检测到")
+        self.ffmpeg_location = ffmpeg_info.get("path")
+        self.ffmpeg_type = str(ffmpeg_info.get("source") or "未检测到")
+
+        self.downloader.ytdlp_location = self.ytdlp_location
+        self.downloader.ffmpeg_location = self.ffmpeg_location
+
+        self._refresh_dependency_badge()
+
+        if self.ytdlp_location and self.ytdlp_type != "未检测到":
+            self.update_log(
+                f"✅ yt-dlp 就绪: {self.ytdlp_type} -> {self.ytdlp_location}"
+            )
+        else:
+            self.update_log("⚠️ 当前未检测到可用 yt-dlp。")
+
+        if self.ffmpeg_location and self.ffmpeg_type != "未检测到":
+            self.update_log(
+                f"✅ FFmpeg 就绪: {self.ffmpeg_type} -> {self.ffmpeg_location}"
+            )
+        else:
+            self.update_log("⚠️ 当前未检测到可用 FFmpeg。")
 
     def on_download(self):
         if self._is_downloading:
             return
 
-        if not self.ffmpeg_location or self.ffmpeg_type == "未检测到":
-            self.update_log(
-                "⚠️ 提示: 缺少 FFmpeg 引擎可能导致部分清晰度合并或转码失败，点击右上角【⚙️ FFmpeg】可配置。"
+        if not self.ytdlp_location or not os.path.isfile(self.ytdlp_location):
+            tkinter.messagebox.showwarning(
+                "缺少核心依赖",
+                "未检测到 yt-dlp 下载引擎，无法开始下载。\n\n"
+                "即将打开【核心依赖配置】，请一键安装到系统默认目录或手动指定路径。",
+                parent=self,
             )
+            self.open_dependency_settings()
+            return
+
+        if (
+            not self.ffmpeg_location
+            or not os.path.isfile(self.ffmpeg_location)
+            or self.ffmpeg_type == "未检测到"
+        ):
+            open_cfg = tkinter.messagebox.askyesno(
+                "缺少 FFmpeg 引擎",
+                "当前未检测到系统 FFmpeg 引擎，1080P+ 音视频合并、格式转换与 MP3 提取可能会失败。\n\n"
+                "是否现在打开【核心依赖配置】一键安装 FFmpeg 到系统目录？\n"
+                "（点击“否”将直接尝试下载）",
+                parent=self,
+            )
+            if open_cfg:
+                self.open_dependency_settings()
+                return
 
         if self.fetch_btn.cget("state") == "disabled":
             self.update_log("错误: 请等待解析完成后再开始下载。")

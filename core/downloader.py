@@ -1,106 +1,117 @@
 from __future__ import annotations
 
+import contextlib
+import json
 import os
 import re
+import subprocess
+import sys
 import threading
 from pathlib import Path
 
-import yt_dlp
-from yt_dlp.utils import DownloadCancelled
+from core.dependency_manager import dependency_manager
 
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
-
-
-class MyLogger:
-    """用于拦截 yt-dlp 日志输出的自定义日志记录器"""
-
-    def __init__(self, log_callback=None):
-        self.log_callback = log_callback
-
-    def debug(self, msg):
-        if msg.startswith("[debug] "):
-            return  # 忽略 debug 级别的调试信息，避免日志过多
-        if self.log_callback:
-            self.log_callback(msg)
-
-    def info(self, msg):
-        if self.log_callback:
-            self.log_callback(msg)
-
-    def warning(self, msg):
-        if self.log_callback:
-            self.log_callback(f"WARNING: {msg}")
-
-    def error(self, msg):
-        if self.log_callback:
-            self.log_callback(f"ERROR: {msg}")
+_PLAYLIST_ITEM_RE = re.compile(
+    r"\[download\]\s+Downloading\s+(?:item|video)\s+(\d+)\s+of\s+(\d+)"
+)
+_DEST_FILE_RE = re.compile(r"^\[download\]\s+Destination:\s+(.+)$")
 
 
 class YTDlpDownloader:
-    """封装 yt-dlp 的核心下载逻辑"""
+    """封装系统 yt-dlp 可执行文件的核心下载逻辑（subprocess 调度）"""
 
     def __init__(
         self,
         ffmpeg_location=None,
+        ytdlp_location=None,
         log_callback=None,
         progress_callback=None,
         playlist_item_callback=None,
     ):
         self.ffmpeg_location = ffmpeg_location
+        self.ytdlp_location = (
+            ytdlp_location
+            if ytdlp_location is not None
+            else dependency_manager.detect_ytdlp().get("path")
+        )
         self.log_callback = log_callback
         self.progress_callback = progress_callback
         self.playlist_item_callback = playlist_item_callback
-        # 记录当前下载的进度状态与取消事件
+
         self._cancel_event = threading.Event()
-        self._current_filenames = set()
+        self._current_process: subprocess.Popen | None = None
+        self._current_filenames: set[str] = set()
+
+    @staticmethod
+    def _creation_flags() -> int:
+        return subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
+    def _has_valid_ytdlp(self) -> bool:
+        return bool(self.ytdlp_location and os.path.isfile(self.ytdlp_location))
 
     def format_error_message(self, err: BaseException | str) -> str:
-        """将 yt-dlp 产生的异常信息解析为用户友好的提示信息"""
+        """将 yt-dlp 产生的异常或输出信息解析为用户友好的提示信息"""
         msg = str(err)
-        # 去除 ANSI 终端颜色控制码
         clean_msg = _ANSI_ESCAPE.sub("", msg).strip()
+        lower_msg = clean_msg.lower()
 
-        # 常见错误特征匹配与分类引导
+        if "yt-dlp" in lower_msg and (
+            "not found" in lower_msg
+            or "missing" in lower_msg
+            or "no such file" in lower_msg
+            or "未检测" in clean_msg
+        ):
+            return (
+                "yt-dlp 引擎缺失或无法执行。\n"
+                "💡 建议：请点击右上方【⚙️ 依赖配置】，一键安装 yt-dlp 到系统目录或手动指定路径。"
+            )
+        if "please update yt-dlp" in lower_msg or "update yt-dlp" in lower_msg:
+            return (
+                "当前 yt-dlp 版本过旧，网站解析规则可能已变更。\n"
+                "💡 建议：请在右上角【⚙️ 依赖配置】中点击重新安装更新，或终端运行 brew upgrade yt-dlp。"
+            )
         if "HTTP Error 403" in clean_msg or "Forbidden" in clean_msg:
             return (
                 "请求被服务器拒绝 (HTTP 403 Forbidden)。\n"
                 "💡 建议：该网站可能有反爬或防盗链限制，请尝试在上方配置对应的 Cookie 文件后再试。"
             )
-        elif (
+        if (
             "Sign in to confirm you’re not a bot" in clean_msg
+            or "Sign in to confirm you're not a bot" in clean_msg
             or "Sign in to confirm your age" in clean_msg
-            or "login" in clean_msg.lower()
+            or "login" in lower_msg
         ):
             return (
                 "需要登录验证 (年龄限制 / 人机验证 / 会员专享)。\n"
                 "💡 建议：请在浏览器中登录该网站，导出 cookies.txt 放入 cookies/ 目录并选用后重试。"
             )
-        elif (
-            clean_msg.find("This video is not available") != -1
-            or clean_msg.find("Video unavailable") != -1
+        if (
+            "This video is not available" in clean_msg
+            or "Video unavailable" in clean_msg
         ):
             return (
                 "视频不可用。\n"
                 "💡 建议：视频可能已被作者删除、设为私享或在当前地区受限 (Geo-restricted)。"
             )
-        elif "Unsupported URL" in clean_msg:
+        if "Unsupported URL" in clean_msg:
             return "不支持的链接格式。\n💡 建议：请检查输入的 URL 是否完整且正确。"
-        elif "ffmpeg" in clean_msg.lower() and (
-            "not found" in clean_msg.lower() or "missing" in clean_msg.lower()
+        if "ffmpeg" in lower_msg and (
+            "not found" in lower_msg
+            or "missing" in lower_msg
+            or "not installed" in lower_msg
         ):
             return (
                 "FFmpeg 缺失或无法执行。\n"
-                "💡 建议：点击右上方 FFmpeg 状态胶囊，根据指引自动安装或手动配置 FFmpeg。"
+                "💡 建议：点击右上方【⚙️ 依赖配置】，一键安装 FFmpeg 到系统目录或手动指定路径。"
             )
-        elif (
-            "timed out" in clean_msg.lower()
-            or "connection reset" in clean_msg.lower()
-            or "network" in clean_msg.lower()
+        if (
+            "timed out" in lower_msg
+            or "connection reset" in lower_msg
+            or "network" in lower_msg
         ):
             return "网络连接超时或中断。\n💡 建议：请检查网络连接或代理设置后重试。"
 
-        # 默认返回提取后的简洁错误信息
-        # 如果包含 ERROR: 前缀，提取主要错误行
         error_lines = [
             line.strip() for line in clean_msg.splitlines() if "ERROR:" in line
         ]
@@ -108,207 +119,242 @@ class YTDlpDownloader:
             return "\n".join(error_lines)
         return clean_msg[:300] if len(clean_msg) > 300 else clean_msg
 
-    def get_base_options(self):
-        """获取 yt-dlp 基础配置选项"""
-        opts = {
-            "logger": MyLogger(self.log_callback),
-            "progress_hooks": [self._progress_hook],
-            "noprogress": True,  # 禁用默认控制台进度条
-            "quiet": False,
-            "socket_timeout": 30,
-            # 断点续传支持：默认保留 .part 文件并允许继续下载
-            "continuedl": True,
-        }
-        if self.ffmpeg_location and os.path.exists(self.ffmpeg_location):
-            opts["ffmpeg_location"] = self.ffmpeg_location
-        return opts
+    @staticmethod
+    def _parse_single_json(stdout: str) -> dict | None:
+        text = stdout.strip()
+        if not text:
+            return None
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict):
+                return data
+        except json.JSONDecodeError:
+            pass
 
-    def _progress_hook(self, d):
-        """处理 yt-dlp 进度回调"""
-        if "filename" in d and d["filename"]:
-            self._current_filenames.add(d["filename"])
-
-        if self._cancel_event.is_set():
-            raise DownloadCancelled("Download cancelled by user.")
-
-        if d["status"] == "downloading":
-            try:
-                downloaded = d.get("downloaded_bytes", 0) or 0
-                total = d.get("total_bytes") or d.get("total_bytes_estimate", 0) or 1
-                percent = min(downloaded / total, 1.0)
-                speed = d.get("_speed_str", "N/A")
-                eta = d.get("_eta_str", "N/A")
-
-                if self.progress_callback:
-                    self.progress_callback(percent, speed, eta)
-            except (ValueError, TypeError, ZeroDivisionError):
-                pass
-        elif d["status"] == "finished":
-            if self.progress_callback:
-                self.progress_callback(1.0, "Done", "0s")
-            if self.log_callback:
-                self.log_callback("Download complete, now post-processing...")
-        elif d["status"] == "error" and self.log_callback:
-            self.log_callback("Error occurred during download.")
+        for line in reversed(text.splitlines()):
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    data = json.loads(line)
+                    if isinstance(data, dict):
+                        return data
+                except json.JSONDecodeError:
+                    continue
+        return None
 
     def fetch_info(self, url, cookiefile=None):
-        """提取视频或播放列表信息（如标题、所有可用格式、字幕或播放列表条目），不进行下载"""
-        opts = self.get_base_options()
-        opts["extract_flat"] = "in_playlist"  # 快速探测是否为播放列表
+        """调用系统 yt-dlp 提取视频或播放列表信息，不进行下载"""
+        if not self._has_valid_ytdlp():
+            return {
+                "status": "error",
+                "message": "未检测到 yt-dlp 解析引擎。\n💡 建议：请点击右上角【⚙️ 依赖配置】一键安装到系统目录或手动指定路径。",
+            }
+
+        assert self.ytdlp_location is not None
+        cmd = [
+            self.ytdlp_location,
+            "--dump-single-json",
+            "--flat-playlist",
+            "--no-warnings",
+            "--color",
+            "no_color",
+            "--socket-timeout",
+            "30",
+        ]
+        if self.ffmpeg_location and os.path.exists(self.ffmpeg_location):
+            cmd.extend(["--ffmpeg-location", self.ffmpeg_location])
         if cookiefile and os.path.exists(cookiefile):
-            opts["cookiefile"] = cookiefile
+            cmd.extend(["--cookies", cookiefile])
+        cmd.append(url)
 
-        with yt_dlp.YoutubeDL(opts) as ydl:  # type: ignore
-            try:
-                info = ydl.extract_info(url, download=False)
-                if not info:
-                    return {
-                        "status": "error",
-                        "message": "未能获取到任何视频或播放列表信息。",
-                    }
+        try:
+            res = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=90,
+                creationflags=self._creation_flags(),
+            )
+            if res.returncode != 0:
+                err_output = res.stderr.strip() or res.stdout.strip() or f"yt-dlp 返回码 {res.returncode}"
+                return {"status": "error", "message": self.format_error_message(err_output)}
 
-                # --- 处理播放列表情况 ---
-                if info.get("_type") == "playlist" or "entries" in info:
-                    raw_entries = info.get("entries")
-                    entries = []
-                    if raw_entries:
-                        for entry in raw_entries:
-                            if entry:
-                                entries.append(entry)
-                    items = []
-                    for idx, entry in enumerate(entries, 1):
-                        e_title = entry.get("title") or f"视频 {idx}"
-                        e_url = (
-                            entry.get("url")
-                            or entry.get("webpage_url")
-                            or entry.get("id")
-                        )
-                        e_dur = entry.get("duration")
-                        dur_str = (
-                            f"{int(e_dur // 60):02d}:{int(e_dur % 60):02d}"
-                            if e_dur
-                            else ""
-                        )
-                        items.append(
-                            {
-                                "index": idx,
-                                "id": entry.get("id", str(idx)),
-                                "title": e_title,
-                                "url": e_url,
-                                "duration_str": dur_str,
-                            }
-                        )
+            info = self._parse_single_json(res.stdout)
+            if not info:
+                return {
+                    "status": "error",
+                    "message": "未能获取到有效的视频或播放列表元数据。",
+                }
 
-                    return {
-                        "status": "success",
-                        "is_playlist": True,
-                        "title": info.get("title", "播放列表"),
-                        "playlist_count": len(items),
-                        "items": items,
-                        "video_opts": [{"id": "best", "desc": "自动最高画质 (Best)"}],
-                        "audio_opts": [{"id": "best", "desc": "自动最高音质 (Best)"}],
-                        "subtitle_opts": [],
-                    }
-
-                # --- 单个视频解析流程 ---
-                title = info.get("title", "Unknown Title")
-                formats = info.get("formats") or []
-                video_opts = []
-                audio_opts = []
-
-                for f in formats:
-                    f_id = f.get("format_id")
-                    ext = f.get("ext", "unknown")
-                    vcodec = f.get("vcodec", "none")
-                    acodec = f.get("acodec", "none")
-                    # 获取文件大小（优先精确值，否则取估算值）
-                    filesize = f.get("filesize") or f.get("filesize_approx")
-
-                    if vcodec != "none":
-                        height = f.get("height") or 0
-                        fps = f.get("fps")
-                        fps_str = f" {fps}fps" if fps else ""
-                        v_str = f"{height}p{fps_str} - {ext} ({vcodec})"
-                        video_opts.append(
-                            {
-                                "id": f_id,
-                                "desc": v_str,
-                                "height": height,
-                                "filesize": filesize,
-                            }
-                        )
-
-                    if acodec != "none":
-                        abr = f.get("abr") or 0
-                        abr_str = f"{abr}k" if abr else "unknown"
-                        a_str = f"{abr_str} - {ext} ({acodec})"
-                        audio_opts.append(
-                            {
-                                "id": f_id,
-                                "desc": a_str,
-                                "abr": abr,
-                                "filesize": filesize,
-                            }
-                        )
-
-                # 排序：视频按分辨率降序，音频按比特率降序
-                video_opts = sorted(video_opts, key=lambda x: x["height"], reverse=True)
-                audio_opts = sorted(audio_opts, key=lambda x: x["abr"], reverse=True)
-
-                # --- 提取字幕信息 ---
-                subtitle_opts = []
-                manual_subs = info.get("subtitles", {})
-                auto_subs = info.get("automatic_captions", {})
-
-                for lang, sub_list in manual_subs.items():
-                    # 尝试获取语言名称（部分格式携带 name 字段）
-                    name = lang
-                    if (
-                        sub_list
-                        and isinstance(sub_list, list)
-                        and sub_list[0].get("name")
-                    ):
-                        name = sub_list[0]["name"]
-                    subtitle_opts.append(
+            # --- 处理播放列表情况 ---
+            if info.get("_type") == "playlist" or "entries" in info:
+                raw_entries = info.get("entries") or []
+                entries = [entry for entry in raw_entries if entry]
+                items = []
+                for idx, entry in enumerate(entries, 1):
+                    e_title = entry.get("title") or f"视频 {idx}"
+                    e_url = (
+                        entry.get("url")
+                        or entry.get("webpage_url")
+                        or entry.get("id")
+                    )
+                    e_dur = entry.get("duration")
+                    dur_str = (
+                        f"{int(e_dur // 60):02d}:{int(e_dur % 60):02d}"
+                        if e_dur
+                        else ""
+                    )
+                    items.append(
                         {
-                            "lang": lang,
-                            "desc": f"{name} ({lang})",
-                            "auto": False,
+                            "index": idx,
+                            "id": entry.get("id", str(idx)),
+                            "title": e_title,
+                            "url": e_url,
+                            "duration_str": dur_str,
                         }
                     )
-
-                for lang, sub_list in auto_subs.items():
-                    if lang in manual_subs:
-                        continue  # 手动字幕优先，跳过同语言的自动字幕
-                    name = lang
-                    if (
-                        sub_list
-                        and isinstance(sub_list, list)
-                        and sub_list[0].get("name")
-                    ):
-                        name = sub_list[0]["name"]
-                    subtitle_opts.append(
-                        {
-                            "lang": lang,
-                            "desc": f"{name} [{lang}] (自动)",
-                            "auto": True,
-                        }
-                    )
-
-                # 排序：手动字幕优先，然后按语言代码字母顺序
-                subtitle_opts.sort(key=lambda x: (x["auto"], x["lang"]))
 
                 return {
                     "status": "success",
-                    "is_playlist": False,
-                    "title": title,
-                    "video_opts": video_opts,
-                    "audio_opts": audio_opts,
-                    "subtitle_opts": subtitle_opts,
+                    "is_playlist": True,
+                    "title": info.get("title", "播放列表"),
+                    "playlist_count": len(items),
+                    "items": items,
+                    "video_opts": [{"id": "best", "desc": "自动最高画质 (Best)"}],
+                    "audio_opts": [{"id": "best", "desc": "自动最高音质 (Best)"}],
+                    "subtitle_opts": [],
                 }
-            except Exception as e:
-                friendly_msg = self.format_error_message(e)
-                return {"status": "error", "message": friendly_msg}
+
+            # --- 单个视频解析流程 ---
+            title = info.get("title", "Unknown Title")
+            formats = info.get("formats") or []
+            video_opts = []
+            audio_opts = []
+
+            for f in formats:
+                f_id = f.get("format_id")
+                ext = f.get("ext", "unknown")
+                vcodec = f.get("vcodec", "none")
+                acodec = f.get("acodec", "none")
+                filesize = f.get("filesize") or f.get("filesize_approx")
+
+                if vcodec != "none":
+                    height = f.get("height") or 0
+                    fps = f.get("fps")
+                    fps_str = f" {fps}fps" if fps else ""
+                    v_str = f"{height}p{fps_str} - {ext} ({vcodec})"
+                    video_opts.append(
+                        {
+                            "id": f_id,
+                            "desc": v_str,
+                            "height": height,
+                            "filesize": filesize,
+                        }
+                    )
+
+                if acodec != "none":
+                    abr = f.get("abr") or 0
+                    abr_str = f"{abr}k" if abr else "unknown"
+                    a_str = f"{abr_str} - {ext} ({acodec})"
+                    audio_opts.append(
+                        {
+                            "id": f_id,
+                            "desc": a_str,
+                            "abr": abr,
+                            "filesize": filesize,
+                        }
+                    )
+
+            video_opts = sorted(video_opts, key=lambda x: x["height"], reverse=True)
+            audio_opts = sorted(audio_opts, key=lambda x: x["abr"], reverse=True)
+
+            # --- 提取字幕信息 ---
+            subtitle_opts = []
+            manual_subs = info.get("subtitles") or {}
+            auto_subs = info.get("automatic_captions") or {}
+
+            for lang, sub_list in manual_subs.items():
+                name = lang
+                if sub_list and isinstance(sub_list, list) and sub_list[0].get("name"):
+                    name = sub_list[0]["name"]
+                subtitle_opts.append(
+                    {"lang": lang, "desc": f"{name} ({lang})", "auto": False}
+                )
+
+            for lang, sub_list in auto_subs.items():
+                if lang in manual_subs:
+                    continue
+                name = lang
+                if sub_list and isinstance(sub_list, list) and sub_list[0].get("name"):
+                    name = sub_list[0]["name"]
+                subtitle_opts.append(
+                    {"lang": lang, "desc": f"{name} [{lang}] (自动)", "auto": True}
+                )
+
+            subtitle_opts.sort(key=lambda x: (x["auto"], x["lang"]))
+
+            return {
+                "status": "success",
+                "is_playlist": False,
+                "title": title,
+                "video_opts": video_opts,
+                "audio_opts": audio_opts,
+                "subtitle_opts": subtitle_opts,
+            }
+        except subprocess.TimeoutExpired:
+            return {
+                "status": "error",
+                "message": "解析视频信息超时。\n💡 建议：请检查网络连接或代理设置后重试。",
+            }
+        except Exception as e:
+            return {"status": "error", "message": self.format_error_message(e)}
+
+    @staticmethod
+    def _parse_num(val: str) -> float | None:
+        cleaned = val.strip()
+        if not cleaned or cleaned in ("NA", "None", "N/A"):
+            return None
+        try:
+            return float(cleaned)
+        except ValueError:
+            return None
+
+    def _handle_progress_line(self, payload: str):
+        parts = payload.split("|", 5)
+        if len(parts) < 6:
+            return
+        dl_str, tot_str, est_str, speed_str, eta_str, filename = parts
+
+        filename = filename.strip()
+        if filename and filename not in ("NA", "None"):
+            self._current_filenames.add(filename)
+
+        downloaded = self._parse_num(dl_str) or 0.0
+        total = self._parse_num(tot_str) or self._parse_num(est_str) or 1.0
+        percent = min(max(downloaded / total, 0.0), 1.0) if total > 0 else 0.0
+
+        speed = speed_str.strip()
+        if not speed or speed in ("NA", "None"):
+            speed = "N/A"
+        eta = eta_str.strip()
+        if not eta or eta in ("NA", "None"):
+            eta = "N/A"
+
+        if self.progress_callback:
+            self.progress_callback(percent, speed, eta)
+
+    def _terminate_process(self, proc: subprocess.Popen):
+        if proc.poll() is not None:
+            return
+        with contextlib.suppress(Exception):
+            proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(Exception):
+                proc.kill()
 
     def download(
         self,
@@ -324,93 +370,160 @@ class YTDlpDownloader:
         playlist_items=None,
         cleanup_on_cancel=False,
     ):
-        """执行视频或播放列表下载，支持断点续传、字幕下载与取消控制
+        """通过系统 yt-dlp 子进程执行下载，支持断点续传、字幕下载与取消控制"""
+        if not self._has_valid_ytdlp():
+            return {
+                "status": "error",
+                "message": "未检测到 yt-dlp 下载引擎。\n💡 建议：请点击右上角【⚙️ 依赖配置】一键安装到系统目录或手动指定路径。",
+            }
 
-        :param cleanup_on_cancel: 取消时是否彻底删除未完成的 .part 临时文件。为 False
-        时保留 .part 文件以便后续断点续传
-        """
+        assert self.ytdlp_location is not None
         self._cancel_event.clear()
         self._current_filenames.clear()
-        opts = self.get_base_options()
 
-        # 配置存储路径与模板
+        cmd = [
+            self.ytdlp_location,
+            "--newline",
+            "--color",
+            "no_color",
+            "--socket-timeout",
+            "30",
+            "--continue",
+            "--progress-template",
+            "download:[YDD_PROG]%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress._speed_str)s|%(progress._eta_str)s|%(progress.filename)s",
+        ]
+
+        if self.ffmpeg_location and os.path.exists(self.ffmpeg_location):
+            cmd.extend(["--ffmpeg-location", self.ffmpeg_location])
+
+        # 存储路径与播放列表参数
         if is_playlist:
-            # 播放列表组织为专属文件夹或前缀编号
             outtmpl = os.path.join(
                 output_path,
                 "%(playlist_title|Playlist)s",
                 "%(playlist_index&{:03d} - |)s%(title)s.%(ext)s",
             )
+            cmd.append("--yes-playlist")
             if playlist_items:
-                # 支持选择指定的集数范围（例如 '1,3-5,8'）
-                opts["playlist_items"] = str(playlist_items)
-            opts["noplaylist"] = False
+                cmd.extend(["--playlist-items", str(playlist_items)])
         else:
             outtmpl = os.path.join(output_path, "%(title)s.%(ext)s")
-            opts["noplaylist"] = True
+            cmd.append("--no-playlist")
 
-        opts["outtmpl"] = outtmpl
+        cmd.extend(["-o", outtmpl])
 
         # 构造 format 字符串
         v_id = video_format_id
         a_id = audio_format_id
 
         if v_id == "none" and a_id == "none":
-            opts["format"] = "bestvideo+bestaudio/best"
+            fmt_expr = "bestvideo+bestaudio/best"
         elif v_id == "none":
-            opts["format"] = a_id
-            opts["extract_audio"] = True
+            fmt_expr = a_id
         elif a_id == "none":
-            opts["format"] = v_id
+            fmt_expr = v_id
         else:
             if v_id == "best" and a_id == "best":
-                opts["format"] = "bestvideo+bestaudio/best"
+                fmt_expr = "bestvideo+bestaudio/best"
             elif v_id == "best":
-                opts["format"] = f"bestvideo+{a_id}/best"
+                fmt_expr = f"bestvideo+{a_id}/best"
             elif a_id == "best":
-                opts["format"] = f"{v_id}+bestaudio/best"
+                fmt_expr = f"{v_id}+bestaudio/best"
             else:
-                opts["format"] = f"{v_id}+{a_id}"
+                fmt_expr = f"{v_id}+{a_id}"
 
-        # 配置合并格式或后处理 (如果是纯音频则单独处理)
+        cmd.extend(["-f", fmt_expr])
+
+        # 合并格式或纯音频提取
         if v_id != "none":
-            opts["merge_output_format"] = format_type
+            cmd.extend(["--merge-output-format", format_type])
         else:
-            # 纯音频下载，提取/转换为选定的音频格式
             audio_format = (
                 format_type
                 if format_type in ["mp3", "m4a", "wav", "flac", "opus"]
                 else "mp3"
             )
-            opts["postprocessors"] = [
-                {
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": audio_format,
-                    "preferredquality": "192" if audio_format == "mp3" else "0",
-                }
-            ]
+            cmd.extend(
+                [
+                    "-x",
+                    "--audio-format",
+                    audio_format,
+                    "--audio-quality",
+                    "192K" if audio_format == "mp3" else "0",
+                ]
+            )
 
-        # --- 配置字幕 ---
+        # 字幕配置（兼容手动字幕与自动字幕）
         if subtitle_lang and subtitle_lang != "none":
-            opts["writesubtitles"] = True
-            opts["subtitleslangs"] = [subtitle_lang]
-            opts["subtitlesformat"] = "srt/vtt"
+            cmd.extend(
+                [
+                    "--write-subs",
+                    "--write-auto-subs",
+                    "--sub-langs",
+                    str(subtitle_lang),
+                    "--sub-format",
+                    "srt/vtt",
+                ]
+            )
             if subtitle_embed and v_id != "none":
-                # 嵌入字幕到视频文件中
-                opts["embedsubtitles"] = True
-                pp_list = opts.get("postprocessors", [])
-                pp_list.append({"key": "FFmpegEmbedSubtitle"})
-                opts["postprocessors"] = pp_list
+                cmd.append("--embed-subs")
 
-        # 配置 Cookie
         if cookiefile and os.path.exists(cookiefile):
-            opts["cookiefile"] = cookiefile
+            cmd.extend(["--cookies", cookiefile])
 
-        with yt_dlp.YoutubeDL(opts) as ydl:  # type: ignore
-            try:
-                ydl.download([url])
-                return {"status": "success"}
-            except DownloadCancelled:
+        cmd.append(url)
+
+        output_tail: list[str] = []
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                creationflags=self._creation_flags(),
+            )
+            self._current_process = proc
+
+            if proc.stdout:
+                for raw_line in proc.stdout:
+                    if self._cancel_event.is_set():
+                        self._terminate_process(proc)
+                        break
+
+                    line = _ANSI_ESCAPE.sub("", raw_line).rstrip("\r\n")
+                    if not line:
+                        continue
+
+                    if line.startswith("[YDD_PROG]"):
+                        self._handle_progress_line(line[len("[YDD_PROG]") :])
+                        continue
+
+                    # 记录输出尾部以备错误提取
+                    output_tail.append(line)
+                    if len(output_tail) > 80:
+                        output_tail.pop(0)
+
+                    # 捕获目标文件名，便于取消后清理临时文件
+                    dest_match = _DEST_FILE_RE.match(line)
+                    if dest_match:
+                        self._current_filenames.add(dest_match.group(1).strip())
+
+                    # 捕获合集切集事件
+                    item_match = _PLAYLIST_ITEM_RE.search(line)
+                    if item_match and self.playlist_item_callback:
+                        idx = int(item_match.group(1))
+                        total = int(item_match.group(2))
+                        self.playlist_item_callback(idx, total, f"第 {idx} 项")
+
+                    if self.log_callback:
+                        self.log_callback(line)
+
+            retcode = proc.wait()
+
+            if self._cancel_event.is_set():
                 if cleanup_on_cancel:
                     self._cleanup_partial_files(base_dir=output_path)
                 elif self.log_callback:
@@ -418,26 +531,27 @@ class YTDlpDownloader:
                         "⏸️ 下载已暂停/取消。保留未完成的 .part 临时文件，支持下次继续下载。"
                     )
                 return {"status": "cancelled", "message": "用户已取消下载"}
-            except BaseException as err:
-                msg = str(err)
-                if self._cancel_event.is_set():
-                    if cleanup_on_cancel:
-                        self._cleanup_partial_files(base_dir=output_path)
-                    elif self.log_callback:
-                        self.log_callback(
-                            "⏸️ 下载已暂停/取消。保留未完成的 .part 临时文件，支持下次继续下载。"
-                        )
-                    return {"status": "cancelled", "message": "用户已取消下载"}
-                if "Download cancelled" in msg:
-                    if cleanup_on_cancel:
-                        self._cleanup_partial_files(base_dir=output_path)
-                    elif self.log_callback:
-                        self.log_callback(
-                            "⏸️ 下载已暂停/取消。保留未完成的 .part 临时文件，支持下次继续下载。"
-                        )
-                    return {"status": "cancelled", "message": "用户已取消下载"}
-                friendly_msg = self.format_error_message(err)
-                return {"status": "error", "message": friendly_msg}
+
+            if retcode == 0:
+                if self.progress_callback:
+                    self.progress_callback(1.0, "Done", "0s")
+                return {"status": "success"}
+
+            err_text = "\n".join(output_tail) or f"yt-dlp 进程退出码: {retcode}"
+            return {"status": "error", "message": self.format_error_message(err_text)}
+
+        except Exception as err:
+            if self._cancel_event.is_set():
+                if cleanup_on_cancel:
+                    self._cleanup_partial_files(base_dir=output_path)
+                elif self.log_callback:
+                    self.log_callback(
+                        "⏸️ 下载已暂停/取消。保留未完成的 .part 临时文件，支持下次继续下载。"
+                    )
+                return {"status": "cancelled", "message": "用户已取消下载"}
+            return {"status": "error", "message": self.format_error_message(err)}
+        finally:
+            self._current_process = None
 
     @staticmethod
     def _is_path_safe(target_path: str, base_dir: str) -> bool:
@@ -451,10 +565,7 @@ class YTDlpDownloader:
             return False
 
     def _cleanup_partial_files(self, base_dir: str | None = None):
-        """清理下载一半产生的残留文件（如取消且用户选择彻底清理时）
-
-        :param base_dir: 限制清理的文件所在的基础输出目录，进行路径安全约束
-        """
+        """清理下载一半产生的残留文件（如取消且用户选择彻底清理时）"""
         for f in list(self._current_filenames):
             for ext in ["", ".part", ".ytdl"]:
                 path = f + ext
@@ -462,7 +573,6 @@ class YTDlpDownloader:
                     continue
 
                 if os.path.exists(path):
-                    # 路径遍历安全防御：若提供了 base_dir，必须确保目标文件在 base_dir 内部
                     if base_dir and not self._is_path_safe(path, base_dir):
                         if self.log_callback:
                             self.log_callback(
@@ -480,5 +590,9 @@ class YTDlpDownloader:
                         pass
 
     def cancel_download(self):
-        """取消当前正在进行的下载任务"""
+        """取消当前正在进行的下载任务并立即终止子进程"""
         self._cancel_event.set()
+        proc = self._current_process
+        if proc is not None and proc.poll() is None:
+            with contextlib.suppress(Exception):
+                proc.terminate()
