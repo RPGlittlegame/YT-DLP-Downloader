@@ -44,11 +44,18 @@ class DependencyManager:
         },
     }
 
+    # 主流 Linux 发行版包管理器安装命令 (Debian/Ubuntu, Fedora/RHEL, Arch/Manjaro)
+    LINUX_INSTALL_COMMANDS = {
+        "apt": "sudo apt update && sudo apt install -y ffmpeg yt-dlp",
+        "dnf": "sudo dnf install -y ffmpeg yt-dlp",
+        "pacman": "sudo pacman -S --noconfirm ffmpeg yt-dlp",
+    }
+
     # 各系统终端快速安装命令参考
     INSTALL_COMMANDS = {
         "darwin": "brew install yt-dlp ffmpeg",
         "win32": "winget install yt-dlp.yt-dlp Gyan.FFmpeg",
-        "linux": "sudo apt update && sudo apt install -y ffmpeg yt-dlp",
+        "linux": LINUX_INSTALL_COMMANDS["apt"],
     }
 
     def __init__(self):
@@ -175,17 +182,21 @@ class DependencyManager:
     def get_system_install_dir() -> str:
         """
         获取当前操作系统的默认外部命令安装目录：
-        - macOS: 优先 /opt/homebrew/bin (Homebrew)，其次 /usr/local/bin，回退 ~/.local/bin
+        - macOS: 默认安装到 Homebrew 目录（Apple Silicon 或存在 /opt/homebrew 为 /opt/homebrew/bin，Intel 回退 /usr/local/bin）
         - Windows: %LOCALAPPDATA%\\Programs\\bin
         - Linux: /usr/local/bin（若可写），否则 ~/.local/bin
         """
         home = os.path.expanduser("~")
         if sys.platform == "darwin":
-            if os.path.isdir("/opt/homebrew/bin") or os.path.isdir("/opt/homebrew"):
+            arch = platform.machine().lower()
+            if (
+                "arm" in arch
+                or "aarch64" in arch
+                or os.path.isdir("/opt/homebrew/bin")
+                or os.path.isdir("/opt/homebrew")
+            ):
                 return "/opt/homebrew/bin"
-            if os.path.isdir("/usr/local/bin"):
-                return "/usr/local/bin"
-            return os.path.join(home, ".local", "bin")
+            return "/usr/local/bin"
 
         if sys.platform == "win32":
             localappdata = os.environ.get(
@@ -201,37 +212,193 @@ class DependencyManager:
             return "/usr/local/bin"
         return os.path.join(home, ".local", "bin")
 
+    @staticmethod
+    def _append_dir_candidates(
+        candidates: list[tuple[str, str]],
+        dirs: list[str],
+        exe_name: str,
+        label: str,
+    ) -> None:
+        for d in dirs:
+            candidates.append((os.path.join(d, exe_name), label))
+
+    @staticmethod
+    def _append_glob_candidates(
+        candidates: list[tuple[str, str]],
+        patterns: list[str],
+        label: str,
+    ) -> None:
+        for pat in patterns:
+            for match in sorted(glob.glob(pat)):
+                candidates.append((match, label))
+
+    @staticmethod
+    def _find_imageio_ffmpeg_candidates() -> list[tuple[str, str]]:
+        """兜底扫描系统/用户 Python 环境中的 imageio_ffmpeg 静态二进制"""
+        home = os.path.expanduser("~")
+        patterns: list[str] = []
+        conda_roots = ("miniconda3", "anaconda3", "miniforge3", "mambaforge")
+
+        if sys.platform == "darwin":
+            patterns.extend([
+                os.path.join(home, ".local", "lib", "python*", "site-packages", "imageio_ffmpeg", "binaries", "ffmpeg*"),
+                os.path.join(home, "Library", "Python", "*", "lib", "python", "site-packages", "imageio_ffmpeg", "binaries", "ffmpeg*"),
+                "/Library/Frameworks/Python.framework/Versions/*/lib/python*/site-packages/imageio_ffmpeg/binaries/ffmpeg*",
+                "/opt/homebrew/lib/python*/site-packages/imageio_ffmpeg/binaries/ffmpeg*",
+                "/usr/local/lib/python*/site-packages/imageio_ffmpeg/binaries/ffmpeg*",
+            ])
+            for root in conda_roots:
+                patterns.append(os.path.join(home, root, "lib", "python*", "site-packages", "imageio_ffmpeg", "binaries", "ffmpeg*"))
+                patterns.append(os.path.join(home, root, "envs", "*", "lib", "python*", "site-packages", "imageio_ffmpeg", "binaries", "ffmpeg*"))
+        elif sys.platform == "win32":
+            localappdata = os.environ.get("LOCALAPPDATA", os.path.join(home, "AppData", "Local"))
+            appdata = os.environ.get("APPDATA", os.path.join(home, "AppData", "Roaming"))
+            patterns.extend([
+                os.path.join(localappdata, "Programs", "Python", "Python*", "Lib", "site-packages", "imageio_ffmpeg", "binaries", "ffmpeg*.exe"),
+                os.path.join(appdata, "Python", "Python*", "site-packages", "imageio_ffmpeg", "binaries", "ffmpeg*.exe"),
+                r"C:\Python*\Lib\site-packages\imageio_ffmpeg\binaries\ffmpeg*.exe",
+            ])
+            for root in conda_roots:
+                patterns.append(os.path.join(home, root, "Lib", "site-packages", "imageio_ffmpeg", "binaries", "ffmpeg*.exe"))
+                patterns.append(os.path.join(home, root, "envs", "*", "Lib", "site-packages", "imageio_ffmpeg", "binaries", "ffmpeg*.exe"))
+        else:
+            patterns.extend([
+                os.path.join(home, ".local", "lib", "python*", "site-packages", "imageio_ffmpeg", "binaries", "ffmpeg*"),
+                "/usr/local/lib/python*/dist-packages/imageio_ffmpeg/binaries/ffmpeg*",
+                "/usr/local/lib/python*/site-packages/imageio_ffmpeg/binaries/ffmpeg*",
+                "/usr/lib/python*/dist-packages/imageio_ffmpeg/binaries/ffmpeg*",
+                "/usr/lib/python*/site-packages/imageio_ffmpeg/binaries/ffmpeg*",
+            ])
+            for root in conda_roots:
+                patterns.append(os.path.join(home, root, "lib", "python*", "site-packages", "imageio_ffmpeg", "binaries", "ffmpeg*"))
+                patterns.append(os.path.join(home, root, "envs", "*", "lib", "python*", "site-packages", "imageio_ffmpeg", "binaries", "ffmpeg*"))
+
+        results: list[tuple[str, str]] = []
+        for pat in patterns:
+            for f in sorted(glob.glob(pat)):
+                if not f.endswith((".py", ".pyc", ".md")) and os.path.isfile(f):
+                    results.append((f, "Python 静态引擎 (imageio_ffmpeg)"))
+        return results
+
     def _find_system_candidates(self, tool: str) -> list[tuple[str, str]]:
         """
-        按平台优先级生成系统探测候选列表: [(路径, 来源标签), ...]
-        macOS 优先探测 Homebrew (/opt/homebrew/bin)
+        按平台优先级生成全面覆盖的系统探测候选列表: [(路径, 来源标签), ...]
+        macOS 优先探测 Homebrew (/opt/homebrew/bin -> /usr/local/bin)，随后覆盖 PATH、MacPorts/Nix、Python/pip/pipx、Conda、应用目录等
         """
         exe_name = self._exe_name(tool)
         home = os.path.expanduser("~")
         candidates: list[tuple[str, str]] = []
+        conda_roots = ("miniconda3", "anaconda3", "miniforge3", "mambaforge")
 
         if sys.platform == "darwin":
-            # 1. macOS 绝对优先 Homebrew 目录
-            candidates.append(
-                (f"/opt/homebrew/bin/{exe_name}", "Homebrew (/opt/homebrew/bin)")
+            # 1. macOS 优先 Homebrew
+            self._append_dir_candidates(candidates, ["/opt/homebrew/bin"], exe_name, "Homebrew (/opt/homebrew/bin)")
+            self._append_dir_candidates(candidates, ["/opt/homebrew/sbin"], exe_name, "Homebrew (/opt/homebrew/sbin)")
+            self._append_dir_candidates(candidates, ["/usr/local/bin"], exe_name, "Homebrew (/usr/local/bin)")
+            self._append_dir_candidates(candidates, ["/usr/local/sbin"], exe_name, "Homebrew (/usr/local/sbin)")
+            self._append_dir_candidates(
+                candidates,
+                [f"/opt/homebrew/opt/{tool}/bin"],
+                exe_name,
+                "Homebrew (/opt/homebrew/opt)",
             )
-            # 2. 常见系统目录 /usr/local/bin
-            candidates.append((f"/usr/local/bin/{exe_name}", "系统 (/usr/local/bin)"))
-            # 3. 环境变量 PATH
+            self._append_dir_candidates(
+                candidates,
+                [f"/usr/local/opt/{tool}/bin"],
+                exe_name,
+                "Homebrew (/usr/local/opt)",
+            )
+
+            # 2. 环境变量 PATH
             which_path = shutil.which(tool) or shutil.which(exe_name)
             if which_path:
                 candidates.append((which_path, "系统 PATH"))
-            # 4. 其他标准系统二进制目录
-            extra_paths = [
-                f"/opt/local/bin/{exe_name}",
-                os.path.join(home, ".local", "bin", exe_name),
-                os.path.join(home, "bin", exe_name),
-            ]
-            extra_paths.extend(
-                glob.glob(f"/Library/Frameworks/Python.framework/Versions/*/bin/{exe_name}")
+
+            # 3. MacPorts / Nix / Fink
+            self._append_dir_candidates(candidates, ["/opt/local/bin", "/opt/local/sbin"], exe_name, "MacPorts")
+            self._append_dir_candidates(
+                candidates,
+                [
+                    os.path.join(home, ".nix-profile", "bin"),
+                    "/nix/var/nix/profiles/default/bin",
+                    "/run/current-system/sw/bin",
+                ],
+                exe_name,
+                "Nix",
             )
-            for p in extra_paths:
-                candidates.append((p, "系统目录"))
+            self._append_dir_candidates(candidates, ["/sw/bin"], exe_name, "Fink")
+
+            # 4. 用户级工具与版本管理器 (pip / pipx / uv / pyenv / asdf / mise / cargo)
+            self._append_dir_candidates(
+                candidates,
+                [
+                    os.path.join(home, ".local", "bin"),
+                    os.path.join(home, "bin"),
+                    os.path.join(home, ".cargo", "bin"),
+                ],
+                exe_name,
+                "用户目录",
+            )
+            self._append_dir_candidates(
+                candidates,
+                [
+                    os.path.join(home, ".pyenv", "shims"),
+                    os.path.join(home, ".asdf", "shims"),
+                    os.path.join(home, ".local", "share", "mise", "shims"),
+                ],
+                exe_name,
+                "版本管理器",
+            )
+            self._append_glob_candidates(
+                candidates,
+                [os.path.join(home, ".pyenv", "versions", "*", "bin", exe_name)],
+                "版本管理器 (pyenv)",
+            )
+
+            # 5. Python 框架与用户级 Python bin
+            self._append_glob_candidates(
+                candidates,
+                [
+                    f"/opt/homebrew/opt/python*/Frameworks/Python.framework/Versions/*/bin/{exe_name}",
+                ],
+                "Python 环境 (Homebrew)",
+            )
+            self._append_glob_candidates(
+                candidates,
+                [
+                    f"/Library/Frameworks/Python.framework/Versions/*/bin/{exe_name}",
+                    os.path.join(home, "Library", "Python", "*", "bin", exe_name),
+                    f"/usr/local/opt/python*/Frameworks/Python.framework/Versions/*/bin/{exe_name}",
+                ],
+                "Python 环境",
+            )
+
+            # 6. Conda / Miniconda / Anaconda / Miniforge / Mambaforge
+            conda_dirs = [os.path.join(home, r, "bin") for r in conda_roots] + [
+                "/opt/homebrew/Caskroom/miniforge/base/bin",
+                "/opt/homebrew/Caskroom/miniconda/base/bin",
+            ]
+            self._append_dir_candidates(candidates, conda_dirs, exe_name, "Conda 环境")
+            self._append_glob_candidates(
+                candidates,
+                [os.path.join(home, r, "envs", "*", "bin", exe_name) for r in conda_roots],
+                "Conda 环境",
+            )
+
+            # 7. 应用目录与系统标准目录
+            self._append_dir_candidates(
+                candidates,
+                [
+                    "/Applications",
+                    "/Applications/FFmpeg",
+                    "/Applications/yt-dlp",
+                    os.path.join(home, "Applications"),
+                    "/usr/bin",
+                    "/bin",
+                ],
+                exe_name,
+                "系统目录",
+            )
 
         elif sys.platform == "win32":
             # 1. 系统 PATH
@@ -239,47 +406,183 @@ class DependencyManager:
             if which_path:
                 candidates.append((which_path, "系统 PATH"))
 
-            # 2. Windows 常见系统与包管理器目录
-            localappdata = os.environ.get(
-                "LOCALAPPDATA", os.path.join(home, "AppData", "Local")
-            )
+            localappdata = os.environ.get("LOCALAPPDATA", os.path.join(home, "AppData", "Local"))
+            appdata = os.environ.get("APPDATA", os.path.join(home, "AppData", "Roaming"))
             progdata = os.environ.get("PROGRAMDATA", r"C:\ProgramData")
             progfiles = os.environ.get("PROGRAMFILES", r"C:\Program Files")
+            progfiles86 = os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")
 
-            extra_win = [
-                os.path.join(localappdata, "Programs", "bin", exe_name),
-                os.path.join(localappdata, "Microsoft", "WinGet", "Links", exe_name),
-                os.path.join(home, "scoop", "shims", exe_name),
-                os.path.join(progdata, "chocolatey", "bin", exe_name),
-                os.path.join(localappdata, "Programs", tool, "bin", exe_name),
-                os.path.join(localappdata, "Programs", tool, exe_name),
-                os.path.join(progfiles, tool, "bin", exe_name),
-                rf"C:\ffmpeg\bin\{exe_name}",
-            ]
-            extra_win.extend(
-                glob.glob(
-                    os.path.join(
-                        localappdata, "Microsoft", "WinGet", "Packages", "*", exe_name
-                    )
-                )
+            # 2. WinGet / Scoop / Chocolatey
+            self._append_dir_candidates(
+                candidates,
+                [os.path.join(localappdata, "Microsoft", "WinGet", "Links")],
+                exe_name,
+                "WinGet",
             )
-            for p in extra_win:
-                candidates.append((p, "系统目录"))
+            self._append_glob_candidates(
+                candidates,
+                [
+                    os.path.join(localappdata, "Microsoft", "WinGet", "Packages", "*", exe_name),
+                    os.path.join(localappdata, "Microsoft", "WinGet", "Packages", "*", "*", "bin", exe_name),
+                    os.path.join(localappdata, "Microsoft", "WinGet", "Packages", "*", "*", exe_name),
+                ],
+                "WinGet",
+            )
+            self._append_dir_candidates(
+                candidates,
+                [
+                    os.path.join(home, "scoop", "shims"),
+                    os.path.join(home, "scoop", "apps", tool, "current", "bin"),
+                    os.path.join(home, "scoop", "apps", tool, "current"),
+                ],
+                exe_name,
+                "Scoop",
+            )
+            self._append_dir_candidates(
+                candidates,
+                [os.path.join(progdata, "chocolatey", "bin")],
+                exe_name,
+                "Chocolatey",
+            )
+
+            # 3. 常见 Windows 安装目录
+            self._append_dir_candidates(
+                candidates,
+                [
+                    os.path.join(localappdata, "Programs", "bin"),
+                    os.path.join(localappdata, "Programs", tool, "bin"),
+                    os.path.join(localappdata, "Programs", tool),
+                    os.path.join(progfiles, tool, "bin"),
+                    os.path.join(progfiles86, tool, "bin"),
+                    r"C:\ffmpeg\bin",
+                    r"C:\tools\ffmpeg\bin",
+                    r"C:\yt-dlp",
+                ],
+                exe_name,
+                "系统目录",
+            )
+
+            # 4. Python & Conda 脚本目录
+            self._append_dir_candidates(
+                candidates, [os.path.join(home, ".local", "bin")], exe_name, "用户目录"
+            )
+            self._append_glob_candidates(
+                candidates,
+                [
+                    os.path.join(localappdata, "Programs", "Python", "Python*", "Scripts", exe_name),
+                    os.path.join(appdata, "Python", "Python*", "Scripts", exe_name),
+                    rf"C:\Python*\Scripts\{exe_name}",
+                ],
+                "Python 环境",
+            )
+            win_conda_dirs: list[str] = []
+            win_conda_globs: list[str] = []
+            for r in conda_roots:
+                win_conda_dirs.extend([
+                    os.path.join(home, r, "Library", "bin"),
+                    os.path.join(home, r, "Scripts"),
+                ])
+                win_conda_globs.extend([
+                    os.path.join(home, r, "envs", "*", "Library", "bin", exe_name),
+                    os.path.join(home, r, "envs", "*", "Scripts", exe_name),
+                ])
+            self._append_dir_candidates(candidates, win_conda_dirs, exe_name, "Conda 环境")
+            self._append_glob_candidates(candidates, win_conda_globs, "Conda 环境")
 
         else:
-            # Linux
+            # Linux (覆盖 apt / dnf / pacman 及主流跨发行版安装位置)
+            # 1. 系统 PATH
             which_path = shutil.which(tool) or shutil.which(exe_name)
             if which_path:
                 candidates.append((which_path, "系统 PATH"))
-            extra_linux = [
-                f"/usr/local/bin/{exe_name}",
-                f"/usr/bin/{exe_name}",
-                os.path.join(home, ".local", "bin", exe_name),
-                os.path.join(home, "bin", exe_name),
-                f"/snap/bin/{exe_name}",
-            ]
-            for p in extra_linux:
-                candidates.append((p, "系统目录"))
+
+            # 2. apt / dnf / pacman 标准系统安装目录
+            self._append_dir_candidates(
+                candidates,
+                [
+                    "/usr/bin",
+                    "/usr/local/bin",
+                    "/usr/local/sbin",
+                    "/usr/sbin",
+                    "/bin",
+                    "/sbin",
+                    "/usr/libexec",
+                ],
+                exe_name,
+                "系统目录 (apt/dnf/pacman)",
+            )
+
+            # 3. 跨发行版包管理器 (Linuxbrew / Snap / Flatpak / Nix)
+            self._append_dir_candidates(
+                candidates,
+                ["/home/linuxbrew/.linuxbrew/bin", os.path.join(home, ".linuxbrew", "bin")],
+                exe_name,
+                "Linuxbrew",
+            )
+            self._append_dir_candidates(
+                candidates, ["/snap/bin", "/var/lib/snapd/snap/bin"], exe_name, "Snap"
+            )
+            self._append_dir_candidates(
+                candidates,
+                [
+                    "/var/lib/flatpak/exports/bin",
+                    os.path.join(home, ".local", "share", "flatpak", "exports", "bin"),
+                ],
+                exe_name,
+                "Flatpak",
+            )
+            self._append_dir_candidates(
+                candidates,
+                [
+                    os.path.join(home, ".nix-profile", "bin"),
+                    "/nix/var/nix/profiles/default/bin",
+                    "/run/current-system/sw/bin",
+                ],
+                exe_name,
+                "Nix",
+            )
+
+            # 4. 用户级工具、版本管理器与 Conda
+            self._append_dir_candidates(
+                candidates,
+                [
+                    os.path.join(home, ".local", "bin"),
+                    os.path.join(home, "bin"),
+                    os.path.join(home, ".cargo", "bin"),
+                ],
+                exe_name,
+                "用户目录",
+            )
+            self._append_dir_candidates(
+                candidates,
+                [
+                    os.path.join(home, ".pyenv", "shims"),
+                    os.path.join(home, ".asdf", "shims"),
+                    os.path.join(home, ".local", "share", "mise", "shims"),
+                ],
+                exe_name,
+                "版本管理器",
+            )
+            self._append_glob_candidates(
+                candidates,
+                [os.path.join(home, ".pyenv", "versions", "*", "bin", exe_name)],
+                "版本管理器 (pyenv)",
+            )
+            self._append_dir_candidates(
+                candidates,
+                [os.path.join(home, r, "bin") for r in conda_roots],
+                exe_name,
+                "Conda 环境",
+            )
+            self._append_glob_candidates(
+                candidates,
+                [os.path.join(home, r, "envs", "*", "bin", exe_name) for r in conda_roots],
+                "Conda 环境",
+            )
+
+        # 兜底：若以上路径均未命中且为 ffmpeg，扫描 Python site-packages 中的 imageio_ffmpeg
+        if tool == "ffmpeg":
+            candidates.extend(self._find_imageio_ffmpeg_candidates())
 
         return candidates
 
@@ -365,13 +668,24 @@ class DependencyManager:
             "ffmpeg": self.detect_ffmpeg(),
         }
 
+    @classmethod
+    def get_linux_install_commands(cls) -> dict[str, str]:
+        """返回主流 Linux 发行版包管理器（apt / dnf / pacman）安装命令"""
+        return dict(cls.LINUX_INSTALL_COMMANDS)
+
     def get_quick_install_command(self) -> str:
-        """获取当前系统适用的包管理器安装命令"""
+        """获取当前系统适用的包管理器安装命令（Linux 自动识别 apt / dnf / pacman）"""
         if sys.platform == "darwin":
             return self.INSTALL_COMMANDS["darwin"]
         if sys.platform == "win32":
             return self.INSTALL_COMMANDS["win32"]
-        return self.INSTALL_COMMANDS["linux"]
+        if shutil.which("apt") or shutil.which("apt-get"):
+            return self.LINUX_INSTALL_COMMANDS["apt"]
+        if shutil.which("dnf"):
+            return self.LINUX_INSTALL_COMMANDS["dnf"]
+        if shutil.which("pacman"):
+            return self.LINUX_INSTALL_COMMANDS["pacman"]
+        return " / ".join(f"{k}: {v}" for k, v in self.LINUX_INSTALL_COMMANDS.items())
 
     def get_download_url(self, tool: str = "ffmpeg") -> str | None:
         """获取适合当前平台架构的官方静态二进制下载地址"""

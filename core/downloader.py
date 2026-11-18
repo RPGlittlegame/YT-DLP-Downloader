@@ -366,6 +366,7 @@ class YTDlpDownloader:
         cookiefile=None,
         subtitle_lang=None,
         subtitle_embed=True,
+        subtitle_auto: bool | None = None,
         is_playlist=False,
         playlist_items=None,
         cleanup_on_cancel=False,
@@ -412,14 +413,15 @@ class YTDlpDownloader:
 
         cmd.extend(["-o", outtmpl])
 
-        # 构造 format 字符串
+        # 构造 format 字符串与纯音频提取判断
         v_id = video_format_id
         a_id = audio_format_id
+        audio_only_formats = {"mp3", "m4a", "wav", "flac", "opus"}
+        fmt_lower = (format_type or "mp4").lower()
+        is_audio_only = (v_id == "none") or (fmt_lower in audio_only_formats)
 
-        if v_id == "none" and a_id == "none":
-            fmt_expr = "bestvideo+bestaudio/best"
-        elif v_id == "none":
-            fmt_expr = a_id
+        if is_audio_only:
+            fmt_expr = "bestaudio/best" if a_id in ("best", "none", "") else a_id
         elif a_id == "none":
             fmt_expr = v_id
         else:
@@ -435,14 +437,10 @@ class YTDlpDownloader:
         cmd.extend(["-f", fmt_expr])
 
         # 合并格式或纯音频提取
-        if v_id != "none":
-            cmd.extend(["--merge-output-format", format_type])
+        if not is_audio_only:
+            cmd.extend(["--merge-output-format", fmt_lower])
         else:
-            audio_format = (
-                format_type
-                if format_type in ["mp3", "m4a", "wav", "flac", "opus"]
-                else "mp3"
-            )
+            audio_format = fmt_lower if fmt_lower in audio_only_formats else "mp3"
             cmd.extend(
                 [
                     "-x",
@@ -453,19 +451,24 @@ class YTDlpDownloader:
                 ]
             )
 
-        # 字幕配置（兼容手动字幕与自动字幕）
+        # 字幕配置（精确区分手动字幕与自动生成字幕）
         if subtitle_lang and subtitle_lang != "none":
+            if subtitle_auto is True:
+                cmd.append("--write-auto-subs")
+            elif subtitle_auto is False:
+                cmd.append("--write-subs")
+            else:
+                cmd.extend(["--write-subs", "--write-auto-subs"])
+
             cmd.extend(
                 [
-                    "--write-subs",
-                    "--write-auto-subs",
                     "--sub-langs",
                     str(subtitle_lang),
                     "--sub-format",
-                    "srt/vtt",
+                    "srt/vtt/best",
                 ]
             )
-            if subtitle_embed and v_id != "none":
+            if subtitle_embed and not is_audio_only:
                 cmd.append("--embed-subs")
 
         if cookiefile and os.path.exists(cookiefile):

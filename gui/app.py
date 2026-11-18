@@ -70,15 +70,28 @@ class App(ctk.CTk):
         # 默认值及状态变量初始化（必须在 create_widgets 前完成）
         self.output_dir = os.path.expanduser("~/Downloads")
         self.cookie_file = None
-        self.cookie_dir = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cookies"
-        )
+        self.cookie_dir = self._resolve_cookie_dir()
+
+        # 主题循环配置：跟随系统 -> 浅色 -> 深色
+        self._appearance_modes = [
+            ("System", "🌓 主题: 系统"),
+            ("Light", "☀️ 主题: 浅色"),
+            ("Dark", "🌙 主题: 深色"),
+        ]
+        self._appearance_idx = 0
 
         # 选项映射表 desc -> {'id': format_id, 'filesize': bytes_or_None}
-        self.v_opts_map = {}
-        self.a_opts_map = {}
-        # 字幕映射表 desc -> lang_code
-        self.s_opts_map = {}
+        self._has_parsed_info = False
+        self.v_opts_map = {
+            "自动 (Best)": {"id": "best", "filesize": None},
+            "无 (仅音频)": {"id": "none", "filesize": None},
+        }
+        self.a_opts_map = {
+            "自动 (Best)": {"id": "best", "filesize": None},
+            "无 (仅视频)": {"id": "none", "filesize": None},
+        }
+        # 字幕映射表 desc -> {'lang': lang_code, 'auto': bool} | None
+        self.s_opts_map: dict[str, dict[str, Any] | None] = {"无字幕": None}
         # 播放列表元数据及选择状态
         self.is_playlist = False
         self.playlist_entries = []
@@ -204,6 +217,21 @@ class App(ctk.CTk):
         )
         self.title_label.grid(row=0, column=0, sticky="w")
 
+        # 外观主题一键切换按钮
+        self.theme_btn = ctk.CTkButton(
+            self.title_row,
+            text=self._appearance_modes[self._appearance_idx][1],
+            fg_color=("gray85", "gray25"),
+            text_color=("gray15", "gray90"),
+            hover_color=("gray78", "gray32"),
+            corner_radius=6,
+            font=ctk.CTkFont(size=11),
+            height=24,
+            width=100,
+            command=self.toggle_appearance_mode,
+        )
+        self.theme_btn.grid(row=0, column=1, padx=(8, 6), sticky="e")
+
         # 综合核心依赖状态徽章 (yt-dlp & FFmpeg)
         self.ffmpeg_badge = ctk.CTkButton(
             self.title_row,
@@ -213,7 +241,7 @@ class App(ctk.CTk):
             height=24,
             command=self.open_dependency_settings,
         )
-        self.ffmpeg_badge.grid(row=0, column=1, sticky="e")
+        self.ffmpeg_badge.grid(row=0, column=2, sticky="e")
         self._refresh_dependency_badge()
 
         # --- 选项设置区 ---
@@ -229,9 +257,10 @@ class App(ctk.CTk):
         self.v_quality_combo = ctk.CTkComboBox(
             self.options_frame,
             variable=self.v_quality_var,
-            values=["自动 (Best)"],
+            values=["自动 (Best)", "无 (仅音频)"],
             corner_radius=6,
             width=160,
+            command=self._on_video_quality_select,
         )
         self.v_quality_combo.grid(row=0, column=1, padx=5, pady=5, sticky="w")
 
@@ -241,7 +270,7 @@ class App(ctk.CTk):
         self.a_quality_combo = ctk.CTkComboBox(
             self.options_frame,
             variable=self.a_quality_var,
-            values=["自动 (Best)"],
+            values=["自动 (Best)", "无 (仅视频)"],
             corner_radius=6,
             width=160,
         )
@@ -254,9 +283,10 @@ class App(ctk.CTk):
         self.format_combo = ctk.CTkComboBox(
             self.options_frame,
             variable=self.format_var,
-            values=["MP4", "MKV", "AVI", "WMV", "MOV", "MP3"],
+            values=["MP4", "MKV", "AVI", "WMV", "MOV", "MP3", "M4A"],
             corner_radius=6,
             width=160,
+            command=self._on_format_select,
         )
         self.format_combo.grid(row=1, column=1, padx=5, pady=5, sticky="w")
 
@@ -607,6 +637,62 @@ class App(ctk.CTk):
 
         return None
 
+    # ── Cookie 目录解析与管理 ────────────────────────────────────────────────
+    @staticmethod
+    def _resolve_cookie_dir() -> str:
+        """解析可持久化的 Cookie 目录：打包环境使用 ~/.ydd/cookies，源码环境优先项目内 cookies/"""
+        ydd_cookies = os.path.join(os.path.expanduser("~"), ".ydd", "cookies")
+        if getattr(sys, "frozen", False):
+            target = ydd_cookies
+        else:
+            repo_cookies = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cookies"
+            )
+            try:
+                os.makedirs(repo_cookies, exist_ok=True)
+                target = (
+                    repo_cookies if os.access(repo_cookies, os.W_OK) else ydd_cookies
+                )
+            except OSError:
+                target = ydd_cookies
+
+        try:
+            os.makedirs(target, exist_ok=True)
+        except OSError:
+            pass
+        return target
+
+    # ── 主题切换与音视频格式联动 ─────────────────────────────────────────────
+    def toggle_appearance_mode(self):
+        """一键循环切换外观主题：跟随系统 -> 浅色 -> 深色"""
+        self._appearance_idx = (self._appearance_idx + 1) % len(self._appearance_modes)
+        mode, label = self._appearance_modes[self._appearance_idx]
+        ctk.set_appearance_mode(mode)
+        self.theme_btn.configure(text=label)
+        self.update_log(f"🎨 已切换界面主题: {label}")
+
+    def _on_format_select(self, choice):
+        """选择纯音频/视频格式时联动切换视频流选项"""
+        fmt_upper = str(choice).upper()
+        if fmt_upper in ("MP3", "M4A"):
+            if self.v_quality_var.get() != "无 (仅音频)":
+                self.v_quality_var.set("无 (仅音频)")
+        else:
+            if self.v_quality_var.get() == "无 (仅音频)":
+                self.v_quality_var.set("自动 (Best)")
+        self.update_size_estimate()
+
+    def _on_video_quality_select(self, choice):
+        """视频流选择为无 (仅音频) 时自动联动为音频输出格式"""
+        fmt_upper = self.format_var.get().upper()
+        if choice == "无 (仅音频)":
+            if fmt_upper not in ("MP3", "M4A"):
+                self.format_var.set("MP3")
+        else:
+            if fmt_upper in ("MP3", "M4A"):
+                self.format_var.set("MP4")
+        self.update_size_estimate()
+
     # ── 目录选择 ─────────────────────────────────────────────────────────────
     def choose_output_dir(self):
         dir_path = filedialog.askdirectory(initialdir=self.output_dir)
@@ -697,7 +783,7 @@ class App(ctk.CTk):
     # ── 预估大小 ─────────────────────────────────────────────────────────────
     def update_size_estimate(self, *_):
         """根据当前选中的视频/音频格式计算并显示预估文件大小"""
-        if not self.v_opts_map and not self.a_opts_map:
+        if not self._has_parsed_info:
             return  # 尚未解析，不更新
 
         total_bytes = 0
@@ -769,12 +855,29 @@ class App(ctk.CTk):
 
     def update_item_progress(self, index, total, title):
         """播放列表下载时多条目切换回调"""
-        self._current_item_info = (index, total, title)
+        resolved_title = title
+        if (not title or title == f"第 {index} 项") and self.playlist_entries:
+            matched = next(
+                (
+                    e.get("title")
+                    for e in self.playlist_entries
+                    if e.get("index") == index and e.get("title")
+                ),
+                None,
+            )
+            if not matched and 1 <= index <= len(self.playlist_entries):
+                matched = self.playlist_entries[index - 1].get("title")
+            if matched:
+                resolved_title = matched
+
+        self._current_item_info = (index, total, resolved_title)
 
         def task():
-            self.update_log(f"▶️ 开始处理播放列表条目 [{index}/{total}]: {title}")
+            self.update_log(
+                f"▶️ 开始处理播放列表条目 [{index}/{total}]: {resolved_title}"
+            )
             self.status_label.configure(
-                text=f"[{index}/{total}] 准备下载: {title[:20]}..."
+                text=f"[{index}/{total}] 准备下载: {resolved_title[:20]}..."
             )
             self.progress_bar.set(0)
 
@@ -883,14 +986,16 @@ class App(ctk.CTk):
                                     "filesize": ao.get("filesize"),
                                 }
 
-                        # 填充字幕下拉框
+                        # 填充字幕下拉框（保留手动/自动标志）
                         s_vals = ["无字幕"]
                         for so in res.get("subtitle_opts", []):
                             if isinstance(so, dict):
-                                s_vals.append(str(so.get("desc", "")))
-                                self.s_opts_map[str(so.get("desc", ""))] = so.get(
-                                    "lang"
-                                )
+                                desc = str(so.get("desc", ""))
+                                s_vals.append(desc)
+                                self.s_opts_map[desc] = {
+                                    "lang": so.get("lang"),
+                                    "auto": bool(so.get("auto", False)),
+                                }
 
                         self.v_quality_combo.configure(values=v_vals)
                         self.a_quality_combo.configure(values=a_vals)
@@ -900,6 +1005,7 @@ class App(ctk.CTk):
                         self.a_quality_var.set("自动 (Best)")
                         self.sub_var.set("无字幕")
                         self.sub_mode_btn.configure(state="disabled")
+                        self._has_parsed_info = True
 
                         # 有字幕时提示
                         sub_count = len(res.get("subtitle_opts", []))
@@ -914,6 +1020,7 @@ class App(ctk.CTk):
                         self.update_size_estimate()
 
                     else:
+                        self._has_parsed_info = False
                         self.is_playlist = False
                         self.playlist_entries = []
                         self._current_item_info = None
@@ -1079,7 +1186,13 @@ class App(ctk.CTk):
 
         # 字幕参数
         s_desc = self.sub_var.get()
-        subtitle_lang = self.s_opts_map.get(s_desc, None)  # None = 无字幕
+        sub_info = self.s_opts_map.get(s_desc)
+        if isinstance(sub_info, dict):
+            subtitle_lang = sub_info.get("lang")
+            subtitle_auto = bool(sub_info.get("auto", False))
+        else:
+            subtitle_lang = sub_info
+            subtitle_auto = None
         subtitle_embed = self.sub_mode_var.get() == "嵌入视频"
 
         # 播放列表选集过滤
@@ -1132,6 +1245,7 @@ class App(ctk.CTk):
                 cookiefile=self.cookie_file,
                 subtitle_lang=subtitle_lang,
                 subtitle_embed=subtitle_embed,
+                subtitle_auto=subtitle_auto,
                 is_playlist=self.is_playlist,
                 playlist_items=playlist_items_param,
                 cleanup_on_cancel=cleanup_on_cancel,
